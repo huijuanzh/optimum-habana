@@ -341,6 +341,7 @@ def main():
     generation_config.bad_words_ids = bad_words_ids
     generation_config.force_words_ids = force_words_ids
     generation_config.num_return_sequences = args.num_return_sequences
+    generation_config.reuse_cache = True
 
     if args.dataset_name is None:
         # Benchmark over the prompts below

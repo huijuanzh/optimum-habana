@@ -1,5 +1,8 @@
 from .modeling_llama import (
     GaudiLlamaForCausalLM,
+    GaudiLlamaModel,
+    GaudiLlamaAttention,
+    GaudiLlamaDecoderLayer,
     gaudi_llama_attention_forward,
     gaudi_llama_decoder_layer_forward,
     gaudi_llama_model_forward,

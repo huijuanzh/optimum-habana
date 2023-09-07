@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Un
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from transformers.deepspeed import is_deepspeed_zero3_enabled
 from transformers.generation.beam_constraints import DisjunctiveConstraint, PhrasalConstraint
 from transformers.generation.beam_search import BeamScorer, BeamSearchScorer, ConstrainedBeamSearchScorer
@@ -76,6 +77,33 @@ MODELS_OPTIMIZED_WITH_STATIC_SHAPES = [
 
 logger = logging.get_logger(__name__)
 
+def defined(v):
+    return v is not None
+
+def unwrap_ds(model):
+    if hasattr(model, 'module'):
+        return model.module
+    return model
+
+def expand_if_needed(tensor, new_size, value, dim=-1):
+    orig_len = tensor.shape[dim]
+    padding_len = new_size - orig_len
+    if padding_len > 0:
+        if dim == -1:
+            return F.pad(tensor, (0, padding_len), value=value)
+        elif dim == -2:
+            return F.pad(tensor, (0, 0, 0, padding_len), value=value)
+        else:
+            assert False, f'Unsupported dim value: {dim}'
+    return tensor
+
+def expand_layer_cache(past, new_size, value):
+    new_k = expand_if_needed(past[0], new_size, value, dim=-2)
+    new_v = expand_if_needed(past[1], new_size, value, dim=-2)
+    return (new_k, new_v)
+
+def expand_cache(cache, new_size, value):
+    return tuple(expand_layer_cache(layer_past, new_size, value) for layer_past in cache)
 
 class StaticMaxLengthCriteria(StoppingCriteria):
     def __init__(self, max_steps: int):
@@ -445,6 +473,13 @@ class GaudiGenerationMixin(GenerationMixin):
                 )
             generation_config.max_length = generation_config.max_new_tokens + input_ids_length
         self._validate_generated_length(generation_config, input_ids_length, has_default_max_length)
+
+        #prepare for allocate kv cache
+        if not self.config.is_encoder_decoder:
+            if generation_config.use_cache and generation_config.reuse_cache:
+                model_kwargs['reuse_cache'] = True
+                bs, _ = input_ids.shape
+                unwrap_ds(self).allocate_kv_cache(bs * generation_config.num_beams, generation_config.max_length)
 
         # 7. determine generation mode
         generation_mode = self._get_generation_mode(generation_config, assistant_model)
@@ -1095,6 +1130,8 @@ class GaudiGenerationMixin(GenerationMixin):
 
             # prepare model inputs
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+            if model_kwargs["reuse_cache"]:
+                model_inputs["reuse_cache"] = model_kwargs["reuse_cache"]
 
             # forward pass to get next token
             outputs = self(
@@ -1150,6 +1187,7 @@ class GaudiGenerationMixin(GenerationMixin):
                 )
             else:
                 input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+
             if streamer is not None:
                 streamer.put(next_tokens.cpu())
             model_kwargs = self._update_model_kwargs_for_generation(
@@ -1713,6 +1751,7 @@ class GaudiGenerationMixin(GenerationMixin):
         hb_profer = HabanaProfile(warmup=profiling_warmup_steps, active=profiling_steps)
         hb_profer.start()
         this_peer_finished = False  # used by synced_gpus only
+        run_steps = 0
         while True:
             if synced_gpus:
                 # Under synced_gpus the `forward` call must continue until all gpus complete their sequence.
@@ -1808,13 +1847,19 @@ class GaudiGenerationMixin(GenerationMixin):
                 outputs, model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
             )
             if model_kwargs["past_key_values"] is not None:
-                model_kwargs["past_key_values"] = self._reorder_cache(model_kwargs["past_key_values"], beam_idx)
+                if model_kwargs["reuse_cache"]:
+                    model_kwargs["past_key_values"] = unwrap_ds(self).reorder_kv_cache(model_kwargs["past_key_values"], beam_idx)
+                else:
+                    model_kwargs["past_key_values"] = self._reorder_cache(model_kwargs["past_key_values"], beam_idx)
+                if run_steps ==0 and defined(token_idx) and not model_kwargs["reuse_cache"] and max_length is not None:
+                    model_kwargs["past_key_values"] = expand_cache(model_kwargs["past_key_values"], max_length, 0)
 
             if return_dict_in_generate and output_scores:
                 beam_indices = tuple((beam_indices[beam_idx[i]] + (beam_idx[i],) for i in range(len(beam_indices))))
 
             # increase cur_len
             cur_len = cur_len + 1
+            run_steps = run_steps +1
 
             hb_profer.step()
             if stopping_criteria(input_ids, scores) or (beam_scorer.is_done and not lazy_mode):

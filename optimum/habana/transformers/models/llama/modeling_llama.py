@@ -1,11 +1,12 @@
 import math
 from typing import List, Optional, Tuple, Union
+import os
 
 import torch
 import torch.nn.functional as F
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
-from transformers.models.llama.modeling_llama import LlamaForCausalLM, apply_rotary_pos_emb, logger, repeat_kv
-
+from transformers.models.llama.modeling_llama import LlamaForCausalLM, LlamaModel, LlamaDecoderLayer, LlamaAttention, apply_rotary_pos_emb, logger, repeat_kv
+from transformers.models.llama.configuration_llama import LlamaConfig
 
 try:
     from habana_frameworks.torch.hpex.kernels import RotaryPosEmbeddingHelperV2 as FusedRoPE
@@ -19,6 +20,29 @@ except ImportError:
     print("Not using HPU fused kernel for RMSNorm")
     FusedRMSNorm = None
 
+def update(prev, cur, dim, idx):
+    orig_cur = cur
+
+    if prev.shape[0] != cur.shape[0]:
+        assert prev.shape[0] % cur.shape[0] == 0, f'Cannot update kv-cache. BatchSize changed! {prev.shape[0]} vs {cur.shape[0]}'
+        # Repeat to accomodate bs/beam changes
+        cur = cur.repeat(prev.shape[0] // cur.shape[0], 1, 1, 1)
+    if prev.shape[2] != cur.shape[2] and cur.shape[2] != 1:
+        # Pad to accomodate input bucketing
+        padding_len = prev.shape[2] - cur.shape[2]
+        cur = torch.nn.functional.pad(cur, (0, 0, 0, padding_len, 0 , 0))
+    if prev.shape == cur.shape:
+        # Initialize
+        prev.copy_(cur)
+        return orig_cur
+    if os.environ.get('SKIP_KV_CACHE_UPDATE', '0') != '0':
+        # Skip update
+        return prev
+    assert cur.shape[2] == 1, f'Cannot update kv-cache. Unsupported shapes. prev:{prev.shape} cur:{cur.shape}'
+    if idx is not None:
+        return prev.index_copy_(dim, idx - 1, cur)
+    else:
+        return torch.cat((prev, cur), dim=dim)
 
 def gaudi_llama_rmsnorm_forward(self, hidden_states):
     """
@@ -37,6 +61,43 @@ def gaudi_llama_rmsnorm_forward(self, hidden_states):
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)
 
+class GaudiLlamaAttention(LlamaAttention):
+    def __init__(self, config: LlamaConfig):
+        super().__init__(config)
+
+        self.past_key = None
+        self.past_value = None
+
+    def allocate_kv_cache(self, batch_size, seq_len):
+        #key_shape = (batch_size * self.num_heads, seq_len, self.head_dim)
+        #value_shape = (batch_size * self.num_heads, seq_len, self.head_dim)
+        key_shape = (batch_size, self.num_heads, seq_len, self.head_dim)
+        value_shape = (batch_size, self.num_heads, seq_len, self.head_dim)
+        if self.past_key is None or self.past_key.shape != key_shape:
+            device = self.k_proj.weight.device
+            dtype = self.k_proj.weight.dtype
+            self.past_key = torch.empty(key_shape, dtype=dtype, device=device)
+            self.past_value = torch.empty(value_shape, dtype=dtype, device=device)
+
+    def reorder(self, tensor, beam_idx, dim_a, dim_b):
+        num_heads = self.num_heads
+        batch_times_heads = tensor.size(0)
+        batch_size = batch_times_heads // num_heads
+
+        updated = tensor.view(batch_size, num_heads, dim_a, dim_b)
+        #updated = updated.index_select(0, beam_idx)
+        #updated = updated.view(-1, dim_a, dim_b)
+        tensor.copy_(updated)
+
+    def reorder_kv_cache(self, beam_idx: torch.LongTensor):
+        if self.past_key is None:
+            return (None, None)
+
+        head_dim = self.past_key.size(-1)
+        seq_length = self.past_key.size(-2)
+        self.reorder(self.past_key, beam_idx, seq_length, head_dim)
+        self.reorder(self.past_value, beam_idx, seq_length, head_dim)
+        return (self.past_key.shape, self.past_value.shape)
 
 def gaudi_llama_attention_forward(
     self,
@@ -47,6 +108,7 @@ def gaudi_llama_attention_forward(
     output_attentions: bool = False,
     use_cache: bool = False,
     token_idx: Optional[torch.Tensor] = None,
+    reuse_cache: Optional[bool] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
     """
     Copied from LlamaAttention.forward: https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py
@@ -81,19 +143,19 @@ def gaudi_llama_attention_forward(
     key_states = key_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
     value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
 
-    kv_seq_len = key_states.shape[-2]
-    if past_key_value is not None:
-        if token_idx is None:
-            kv_seq_len += past_key_value[0].shape[-2]
-        else:
-            kv_seq_len = past_key_value[0].shape[-2]
-    cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-    query_states, key_states = apply_customized_rope(query_states, key_states, cos, sin, position_ids)
-
-    if past_key_value is not None:
+    if past_key_value is not None or reuse_cache:
         # reuse k, v, self_attention
-        past_key = past_key_value[0]
-        past_value = past_key_value[1]
+        if reuse_cache:
+            past_key = self.past_key
+            past_value = self.past_value
+        else:
+            past_key = past_key_value[0]
+            past_value = past_key_value[1]
+        #to update
+        '''
+        key_states = update(past_key, key_states, 2, token_idx)
+        value_states = update(past_value, value_states, 2, token_idx)
+        '''
         if token_idx is not None:
             past_key.index_copy_(2, token_idx - 1, key_states)
             past_value.index_copy_(2, token_idx - 1, value_states)
@@ -103,7 +165,25 @@ def gaudi_llama_attention_forward(
             key_states = torch.cat([past_key_value[0], key_states], dim=2)
             value_states = torch.cat([past_key_value[1], value_states], dim=2)
 
-    past_key_value = (key_states, value_states) if use_cache else None
+    if use_cache is True:
+        if reuse_cache:
+            past_key_value = (key_states.shape, value_states.shape)
+        else:
+            past_key_value = (key_states, value_states)
+    else:
+        past_key_value = None
+
+    kv_seq_len = key_states.shape[-2]
+    if past_key_value is not None:
+        if token_idx is None:
+            kv_seq_len += past_key_value[0].shape[-2]
+        else:
+            if reuse_cache:
+                kv_seq_len = past_key_value[0][-2]
+            else:
+                kv_seq_len = past_key_value[0].shape[-2]
+    cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+    query_states, key_states = apply_customized_rope(query_states, key_states, cos, sin, position_ids)
 
     # repeat k/v heads if n_kv_heads < n_heads
     key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -149,6 +229,12 @@ def gaudi_llama_attention_forward(
 
     return attn_output, attn_weights, past_key_value
 
+class GaudiLlamaDecoderLayer(LlamaDecoderLayer):
+    def allocate_kv_cache(self, batch_size, seq_len):
+        self.self_attn.allocate_kv_cache(batch_size, seq_len)
+
+    def reorder_kv_cache(self, beam_idx: torch.LongTensor):
+        return self.self_attn.reorder_kv_cache(beam_idx)
 
 def gaudi_llama_decoder_layer_forward(
     self,
@@ -159,6 +245,7 @@ def gaudi_llama_decoder_layer_forward(
     output_attentions: Optional[bool] = False,
     use_cache: Optional[bool] = False,
     token_idx: Optional[torch.Tensor] = None,
+    reuse_cache: Optional[bool] = None,
 ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
     """
     Copied from LlamaDecoderLayer.forward: https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py
@@ -178,6 +265,7 @@ def gaudi_llama_decoder_layer_forward(
         output_attentions=output_attentions,
         use_cache=use_cache,
         token_idx=token_idx,
+        reuse_cache=reuse_cache,
     )
     hidden_states = residual + hidden_states
 
@@ -196,6 +284,13 @@ def gaudi_llama_decoder_layer_forward(
 
     return outputs
 
+class GaudiLlamaModel(LlamaModel):
+    def allocate_kv_cache(self, batch_size, seq_len):
+        for layer in self.layers:
+            layer.allocate_kv_cache(batch_size, seq_len)
+
+    def reorder_kv_cache(self, beam_idx: torch.LongTensor):
+        return tuple(layer.reorder_kv_cache(beam_idx) for layer in self.layers)
 
 def gaudi_llama_model_forward(
     self,
@@ -209,6 +304,7 @@ def gaudi_llama_model_forward(
     output_hidden_states: Optional[bool] = None,
     return_dict: Optional[bool] = None,
     token_idx: Optional[torch.Tensor] = None,
+    reuse_cache: Optional[bool] = None,
 ) -> Union[Tuple, BaseModelOutputWithPast]:
     """
     Copied from LlamaModel.forward: https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py
@@ -237,7 +333,10 @@ def gaudi_llama_model_forward(
     past_key_values_length = 0
 
     if past_key_values is not None:
-        past_key_values_length = past_key_values[0][0].shape[2]
+        if reuse_cache:
+            past_key_values_length = past_key_values[0][0][2]
+        else:
+            past_key_values_length = past_key_values[0][0].shape[2]
         seq_length_with_past = seq_length_with_past + past_key_values_length
 
     if position_ids is None:
@@ -302,6 +401,7 @@ def gaudi_llama_model_forward(
                 output_attentions=output_attentions,
                 use_cache=use_cache,
                 token_idx=token_idx,
+                reuse_cache=reuse_cache,
             )
 
         hidden_states = layer_outputs[0]
@@ -338,6 +438,11 @@ class GaudiLlamaForCausalLM(LlamaForCausalLM):
     - from step2 when enable KV cache, slice next_input_ids from input_ids base on the token_idx
     - from step2 when enable KV cache, slice next_position_ids from position_ids base on the token_idx
     """
+    def allocate_kv_cache(self, batch_size, seq_len):
+        self.model.allocate_kv_cache(batch_size, seq_len)
+
+    def reorder_kv_cache(self, beam_idx: torch.LongTensor):
+        return self.model.reorder_kv_cache(beam_idx)
 
     def forward(
         self,
@@ -352,6 +457,7 @@ class GaudiLlamaForCausalLM(LlamaForCausalLM):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         token_idx: Optional[torch.Tensor] = None,
+        reuse_cache: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -371,6 +477,7 @@ class GaudiLlamaForCausalLM(LlamaForCausalLM):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             token_idx=token_idx,
+            reuse_cache=reuse_cache,
         )
 
         hidden_states = outputs[0]

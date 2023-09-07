@@ -30,6 +30,9 @@ from .models import (
     GaudiGPTJForCausalLM,
     GaudiGPTNeoXForCausalLM,
     GaudiLlamaForCausalLM,
+    GaudiLlamaModel,
+    GaudiLlamaAttention,
+    GaudiLlamaDecoderLayer,
     GaudiMptForCausalLM,
     GaudiMptModel,
     GaudiOPTForCausalLM,
@@ -191,6 +194,9 @@ def adapt_transformers_to_gaudi():
 
     # Optimization for llama generation on Gaudi
     transformers.models.llama.modeling_llama.LlamaForCausalLM = GaudiLlamaForCausalLM
+    transformers.models.llama.modeling_llama.LlamaModel = GaudiLlamaModel
+    transformers.models.llama.modeling_llama.LlamaAttention = GaudiLlamaAttention
+    transformers.models.llama.modeling_llama.LlamaDecoderLayer = GaudiLlamaDecoderLayer
     transformers.models.llama.modeling_llama.LlamaModel.forward = gaudi_llama_model_forward
     transformers.models.llama.modeling_llama.LlamaDecoderLayer.forward = gaudi_llama_decoder_layer_forward
     transformers.models.llama.modeling_llama.LlamaAttention.forward = gaudi_llama_attention_forward
