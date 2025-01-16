@@ -154,7 +154,10 @@ class GaudiFluxAttnProcessor2_0:
         # hidden_states = F.scaled_dot_product_attention(query, key, value, dropout_p=0.0, is_causal=False)
         from habana_frameworks.torch.hpex.kernels import FusedSDPA
 
-        hidden_states = FusedSDPA.apply(query, key, value, None, 0.0, False, None, "fast", None)
+        #hidden_states = FusedSDPA.apply(query, key, value, None, 0.0, False, None, "fast", None)
+        #todo add a arg to pass fast for inference
+        #Optimized softmax mode is supported in recompute training mode only in causal(triangular) mask case
+        hidden_states = FusedSDPA.apply(query, key, value, None, 0.0, False, None)
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
         hidden_states = hidden_states.to(query.dtype)
         if encoder_hidden_states is not None:
@@ -301,6 +304,7 @@ class GaudiFluxPipeline(GaudiDiffusionPipeline, FluxPipeline):
         use_hpu_graphs: bool = False,
         gaudi_config: Union[str, GaudiConfig] = None,
         bf16_full_eval: bool = False,
+        sdp_on_bf16: bool = False,
     ):
         GaudiDiffusionPipeline.__init__(
             self,
@@ -308,6 +312,7 @@ class GaudiFluxPipeline(GaudiDiffusionPipeline, FluxPipeline):
             use_hpu_graphs,
             gaudi_config,
             bf16_full_eval,
+            sdp_on_bf16,
         )
         FluxPipeline.__init__(
             self,
