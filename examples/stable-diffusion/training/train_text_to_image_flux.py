@@ -18,9 +18,11 @@ Fine-tuning script for Stable Diffusion models for text2image.
 Adapted from the following sources:
 https://github.com/huggingface/diffusers/blob/v0.25.1/examples/text_to_image/train_text_to_image_sdxl.py
 """
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import argparse
 import functools
+import copy
 import gc
 import json
 import logging
@@ -43,14 +45,15 @@ import torch.utils.checkpoint
 import transformers
 from accelerate.logging import get_logger
 from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration
-from datasets import load_dataset
+from datasets import load_dataset, Dataset
 from diffusers import (
     AutoencoderKL,
     DDPMScheduler,
     FluxTransformer2DModel,
+    FluxPipeline,
 )
 from diffusers.optimization import get_scheduler
-from diffusers.training_utils import EMAModel, compute_snr
+from diffusers.training_utils import EMAModel, compute_snr, compute_loss_weighting_for_sd3, compute_density_for_timestep_sampling
 from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.torch_utils import is_compiled_module
 from huggingface_hub import create_repo, upload_folder
@@ -129,7 +132,6 @@ def import_model_class_from_model_name_or_path(
         pretrained_model_name_or_path, subfolder=subfolder, revision=revision
     )
     model_class = text_encoder_config.architectures[0]
-    print(f"!!! subfolder:{subfolder} model_class:{model_class}")
 
     if model_class == "CLIPTextModel":
         from transformers import CLIPTextModel
@@ -252,7 +254,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="sdxl-model-finetuned",
+        default="flux-model-finetuned",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument(
@@ -350,6 +352,12 @@ def parse_args(input_args=None):
         help="Initial learning rate (after the potential warmup period) to use.",
     )
     parser.add_argument(
+        "--guidance_scale",
+        type=float,
+        default=3.5,
+        help="the FLUX.1 dev variant is a guidance distilled model",
+    )
+    parser.add_argument(
         "--scale_lr",
         action="store_true",
         default=False,
@@ -370,6 +378,13 @@ def parse_args(input_args=None):
         default=500,
         help="Number of steps for the warmup in the lr scheduler.",
     )
+    parser.add_argument(
+        "--lr_num_cycles",
+        type=int,
+        default=1,
+        help="Number of hard resets of the lr in cosine_with_restarts scheduler.",
+    )
+    parser.add_argument("--lr_power", type=float, default=1.0, help="Power factor of the polynomial scheduler.")
     parser.add_argument(
         "--timestep_bias_strategy",
         type=str,
@@ -434,6 +449,25 @@ def parse_args(input_args=None):
         help=(
             "Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process."
         ),
+    )
+    parser.add_argument(
+        "--weighting_scheme",
+        type=str,
+        default="none",
+        choices=["sigma_sqrt", "logit_normal", "mode", "cosmap", "none"],
+        help=('We default to the "none" weighting scheme for uniform sampling and uniform loss'),
+    )
+    parser.add_argument(
+        "--logit_mean", type=float, default=0.0, help="mean to use when using the `'logit_normal'` weighting scheme."
+    )
+    parser.add_argument(
+        "--logit_std", type=float, default=1.0, help="std to use when using the `'logit_normal'` weighting scheme."
+    )
+    parser.add_argument(
+        "--mode_scale",
+        type=float,
+        default=1.29,
+        help="Scale of mode weighting scheme. Only effective when using the `'mode'` as the `weighting_scheme`.",
     )
     parser.add_argument(
         "--use_8bit_adam", action="store_true", help="Whether or not to use 8-bit Adam from bitsandbytes."
@@ -591,13 +625,7 @@ def parse_args(input_args=None):
         action="store_true",
         help="Checkpoint saving takes a lot of time. Ignore time for checkpoint saving for throughput calculations",
     )
-    parser.add_argument(
-        "--scheduler",
-        default=None,
-        choices=["euler_discrete", "euler_ancestral_discrete", "ddim", "ddpm", "flow_match_euler_discrete"],
-        type=str,
-        help="Name of scheduler",
-    )
+    parser.add_argument("--dataset_sz", type=int, default=32, help="set dataset size to avoid oom")
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -616,6 +644,100 @@ def parse_args(input_args=None):
         raise ValueError("`--proportion_empty_prompts` must be in the range [0, 1].")
 
     return args
+
+
+def _get_t5_prompt_embeds(
+    tokenizer,
+    text_encoder,
+    prompt: Union[str, List[str]] = None,
+    num_images_per_prompt: int = 1,
+    max_sequence_length: int = 512,
+    device: Optional[torch.device] = None,
+    dtype: Optional[torch.dtype] = None,
+):
+    device = text_encoder.device
+    dtype  = text_encoder.dtype
+
+    prompt = [prompt] if isinstance(prompt, str) else prompt
+    batch_size = len(prompt)
+
+    with torch.no_grad():
+        text_inputs = tokenizer(
+            prompt,
+            padding="max_length",
+            max_length=max_sequence_length,
+            truncation=True,
+            return_length=False,
+            return_overflowing_tokens=False,
+            return_tensors="pt",
+        )
+        text_input_ids = text_inputs.input_ids
+        untruncated_ids = tokenizer(prompt, padding="longest", return_tensors="pt").input_ids
+
+        if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(text_input_ids, untruncated_ids):
+            removed_text = tokenizer.batch_decode(untruncated_ids[:, tokenizer.model_max_length- 1 : -1])
+            logger.warning(
+                "The following part of your input was truncated because `max_sequence_length` is set to "
+                f" {max_sequence_length} tokens: {removed_text}"
+            )
+
+        prompt_embeds = text_encoder(text_input_ids.to(device), output_hidden_states=False)[0]
+
+        dtype = text_encoder.dtype
+        prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
+
+        _, seq_len, _ = prompt_embeds.shape
+
+        # duplicate text embeddings and attention mask for each generation per prompt, using mps friendly method
+        prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
+        prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
+
+    return prompt_embeds
+
+
+def _get_clip_prompt_embeds(
+    tokenizer,
+    text_encoder,
+    prompt: Union[str, List[str]],
+    num_images_per_prompt: int = 1,
+    device: Optional[torch.device] = None,
+):
+    device = text_encoder.device 
+
+    prompt = [prompt] if isinstance(prompt, str) else prompt
+    batch_size = len(prompt)
+
+    with torch.no_grad():
+        text_inputs = tokenizer(
+            prompt,
+            padding="max_length",
+            max_length=tokenizer.model_max_length,
+            truncation=True,
+            return_overflowing_tokens=False,
+            return_length=False,
+            return_tensors="pt",
+        )
+
+        text_input_ids = text_inputs.input_ids
+        untruncated_ids = tokenizer(prompt, padding="longest", return_tensors="pt").input_ids
+        if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(text_input_ids, untruncated_ids):
+            removed_text = tokenizer.batch_decode(untruncated_ids[:, tokenizer_max_length - 1 : -1])
+            logger.warning(
+                "The following part of your input was truncated because CLIP can only handle sequences up to"
+                f" {tokenizer.model_max_length} tokens: {removed_text}"
+            )
+        prompt_embeds = text_encoder(text_input_ids.to(device), output_hidden_states=False)
+
+        # Use pooled output of CLIPTextModel
+        prompt_embeds = prompt_embeds.pooler_output
+        prompt_embeds = prompt_embeds.to(dtype=text_encoder.dtype, device=device)
+
+        # duplicate text embeddings for each generation per prompt, using mps friendly method
+        prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt)
+        prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, -1)
+
+        return prompt_embeds
+
 
 
 # Adapted from diffusers.src.diffusers.pipelines.flux.pipeline_flux.encode_prompt
@@ -641,52 +763,11 @@ def encode_prompt(
             # take a random caption if there are multiple
             captions.append(random.choice(caption) if is_train else caption[0])
 
-    with torch.no_grad():
-        for i, (tokenizer, text_encoder) in enumerate(zip(tokenizers, text_encoders)):
-            text_inputs = tokenizer(
-                captions,
-                padding="max_length",
-                max_length=tokenizer.model_max_length,
-                truncation=True,
-                return_overflowing_tokens=False,
-                return_length=False,
-                return_tensors="pt",
-            )
-            text_input_ids = text_inputs.input_ids
-            untruncated_ids = tokenizer(captions, padding="longest", return_tensors="pt").input_ids
-            if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(text_input_ids, untruncated_ids):
-                removed_text = tokenizer.batch_decode(untruncated_ids[:, tokenizer.model_max_length - 1 : -1])
-                logger.warning(
-                    "The following part of your input was truncated because CLIP can only handle sequences up to"
-                    f" {tokenizer.model_max_length} tokens: {removed_text}"
-                )
-            prompt_embeds = text_encoder(
-                text_input_ids.to(text_encoder.device),
-                output_hidden_states=True,
-                return_dict=False,
-            )
-            #import pdb;pdb.set_trace()
-            if i ==0: # We only use the pooled prompt output from the CLIPTextModel
-                #pooled_prompt_embeds = prompt_embeds.pooler_output
-                pooled_prompt_embeds = prompt_embeds[1]
-                bs_embed,  _ = pooled_prompt_embeds.shape
-                pooled_prompt_embeds = pooled_prompt_embeds.view(bs_embed, -1)
-            elif i == 1:  #prompt output from the T5
-                prompt_embeds=prompt_embeds[0]
-                bs_embed, seq_len, _ = prompt_embeds.shape
-                prompt_embeds = prompt_embeds.view(bs_embed, seq_len, -1)
-   
-    #import pdb;pdb.set_trace()
-    #text_ids = torch.zeros(prompt_embeds.shape[1], 3).to(device=prompt_embeds.device, dtype=prompt_embeds.dtype)
-    #text_ids = torch.zeros(prompt_embeds.shape[0], 3).to(device=prompt_embeds.device, dtype=prompt_embeds.dtype)
-    # map creates cache in cpu so need to change tensor to float32
-    return {
-        #"prompt_embeds": prompt_embeds.to(torch.float32),
-        #"pooled_prompt_embeds": pooled_prompt_embeds.to(torch.float32),
-        "prompt_embeds": prompt_embeds.to(torch.bfloat16),
-        "pooled_prompt_embeds": pooled_prompt_embeds.to(torch.bfloat16),
-        #"text_ids":text_ids,
-    }
+    pooled_prompt_embeds = _get_clip_prompt_embeds(tokenizers[0], text_encoders[0], captions)
+    prompt_embeds = _get_t5_prompt_embeds(tokenizers[1], text_encoders[1], captions)
+
+    #return {"prompt_embeds": prompt_embeds.cpu(), "pooled_prompt_embeds": pooled_prompt_embeds.cpu()}
+    return {"prompt_embeds": prompt_embeds, "pooled_prompt_embeds": pooled_prompt_embeds}
 
 
 def compute_vae_encodings(pixel_values, vae):
@@ -694,9 +775,29 @@ def compute_vae_encodings(pixel_values, vae):
     pixel_values = pixel_values.to(vae.device, dtype=vae.dtype)
     with torch.no_grad():
         model_input = vae.encode(pixel_values).latent_dist.sample()
-    model_input = model_input * vae.config.scaling_factor
+    model_input = (model_input - vae.config.shift_factor) * vae.config.scaling_factor
+    #model_input = model_input * vae.config.scaling_factor
     return model_input
 
+def _prepare_latent_image_ids(batch_size, height, width, device, dtype):
+    latent_image_ids = torch.zeros(height, width, 3)
+    latent_image_ids[..., 1] = latent_image_ids[..., 1] + torch.arange(height)[:, None]
+    latent_image_ids[..., 2] = latent_image_ids[..., 2] + torch.arange(width)[None, :]
+
+    latent_image_id_height, latent_image_id_width, latent_image_id_channels = latent_image_ids.shape
+
+    latent_image_ids = latent_image_ids.reshape(
+        latent_image_id_height * latent_image_id_width, latent_image_id_channels
+    )
+
+    return latent_image_ids.to(device=device, dtype=dtype)
+
+def _pack_latents(latents, batch_size, num_channels_latents, height, width):
+    latents = latents.view(batch_size, num_channels_latents, height // 2, 2, width // 2, 2)
+    latents = latents.permute(0, 2, 4, 1, 3, 5)
+    latents = latents.reshape(batch_size, (height // 2) * (width // 2), num_channels_latents * 4)
+
+    return latents
 
 def generate_timestep_weights(args, num_timesteps):
     weights = torch.ones(num_timesteps)
@@ -746,6 +847,8 @@ def main(args):
 
     gaudi_config = GaudiConfig.from_pretrained(args.gaudi_config_name)
     gaudi_config.use_torch_autocast = gaudi_config.use_torch_autocast or args.bf16
+
+
     accelerator = GaudiAccelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision="bf16" if gaudi_config.use_torch_autocast else "no",
@@ -814,29 +917,11 @@ def main(args):
     )
 
     # Load scheduler and models
-    if args.scheduler == "euler_discrete":
-        noise_scheduler = GaudiEulerDiscreteScheduler.from_pretrained(
-            args.pretrained_model_name_or_path, subfolder="scheduler"
-        )
-    elif args.scheduler == "euler_ancestral_discrete":
-        noise_scheduler = GaudiEulerAncestralDiscreteScheduler.from_pretrained(
-            args.pretrained_model_name_or_path, subfolder="scheduler"
-        )
-    elif args.scheduler == "ddim":
-        noise_scheduler = GaudiDDIMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
-    elif args.scheduler == "flow_match_euler_discrete":
-        noise_scheduler = GaudiFlowMatchEulerDiscreteScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
-    elif args.scheduler == "ddpm":
-        noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
-    else:
-        noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
-        if noise_scheduler.config._class_name == "EulerDiscreteScheduler":
-            noise_scheduler = GaudiEulerDiscreteScheduler.from_config(noise_scheduler.config)
-        elif noise_scheduler.config._class_name == "EulerAncestralDiscreteScheduler":
-            noise_scheduler = GaudiEulerAncestralDiscreteScheduler.from_config(noise_scheduler.config)
-        elif noise_scheduler.config._class_name == "DDIMScheduler":
-            noise_scheduler = GaudiDDIMScheduler.from_config(noise_scheduler.config)
+    noise_scheduler = GaudiFlowMatchEulerDiscreteScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+    noise_scheduler_copy = copy.deepcopy(noise_scheduler)
 
+    if(args.sdp_on_bf16):
+        torch._C._set_math_sdp_allow_fp16_bf16_reduction(True)
     # Check for terminal SNR in combination with SNR Gamma
     text_encoder_one = text_encoder_cls_one.from_pretrained(
         args.pretrained_model_name_or_path,
@@ -876,6 +961,7 @@ def main(args):
         variant=args.variant,
         torch_dtype=weight_dtype,
     )
+    transformer=transformer.to('hpu')
 
     # Freeze vae and text encoders.
     vae.requires_grad_(False)
@@ -955,6 +1041,10 @@ def main(args):
         )
         # See more about loading custom images at
         # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
+    
+    ds = Dataset.from_dict(dataset['train'][:args.dataset_sz])
+    dataset['train'] = ds
+
 
     # Preprocessing the datasets.
     # We need to tokenize inputs and targets.
@@ -1054,9 +1144,11 @@ def main(args):
         # fingerprint used by the cache for the other processes to load the result
         # details: https://github.com/huggingface/diffusers/pull/4038#discussion_r1266078401
         new_fingerprint = Hasher.hash(args)
-        train_dataset = train_dataset.map(compute_embeddings_fn, batched=True, batch_size = 512, new_fingerprint=new_fingerprint)
+        train_dataset = train_dataset.map(compute_embeddings_fn, batched=True, batch_size = 32, new_fingerprint=new_fingerprint)
         if len(args.mediapipe) > 0:
             train_dataset = train_dataset.map(attach_metadata, load_from_cache_file=False)
+
+    #print('baymax debug compute embeddings done!')
 
     def collate_fn(examples):
         pixel_values = torch.stack([example["pixel_values"].clone().detach() for example in examples])
@@ -1084,6 +1176,7 @@ def main(args):
 
     del text_encoders, tokenizers
     gc.collect()
+    accelerator.wait_for_everyone()
     # Create EMA for the transformer.
     if args.use_ema:
         ema_transformer = FluxTransformer2DModel.from_pretrained(
@@ -1110,9 +1203,11 @@ def main(args):
                     model.save_pretrained(os.path.join(output_dir, "transformer"))
 
                     # make sure to pop weight so that corresponding model is not saved again
-                    weights.pop()
+                    if weights:
+                        weights.pop()
 
         def load_model_hook(models, input_dir):
+            '''
             if args.use_ema:
                 load_model = EMAModel.from_pretrained(os.path.join(input_dir, "transformer_ema"), FluxTransformer2DModel)
                 ema_transformer.load_state_dict(load_model.state_dict())
@@ -1129,6 +1224,25 @@ def main(args):
 
                 model.load_state_dict(load_model.state_dict())
                 del load_model
+            '''
+            transformer_ = None
+            #if not accelerator.distributed_type == DistributedType.DEEPSPEED:
+            if not accelerator.distributed_type == GaudiDistributedType.DEEPSPEED:
+                if args.use_ema:
+                    load_model = EMAModel.from_pretrained(os.path.join(input_dir, "transformer_ema"), FluxTransformer2DModel)
+                    ema_transformer.load_state_dict(load_model.state_dict())
+                    ema_transformer.to(accelerator.device)
+                    del load_model
+                while len(models) > 0:
+                    model = models.pop()
+
+                    if isinstance(unwrap_model(model), type(unwrap_model(flux_transformer))):
+                        transformer_ = model  # noqa: F841
+                    else:
+                        raise ValueError(f"unexpected save model: {unwrap_model(model).__class__}")
+
+            else:
+                transformer_ = FluxTransformer2DModel.from_pretrained(input_dir, subfolder="transformer")  # noqa: F841
 
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
@@ -1143,11 +1257,13 @@ def main(args):
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
         optimizer=optimizer,
-        num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
-        num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
+        num_warmup_steps=args.lr_warmup_steps * accelerator.num_processes,
+        num_training_steps=args.max_train_steps * accelerator.num_processes,
+        num_cycles=args.lr_num_cycles,
+        power=args.lr_power,
     )
 
-    transformer = transformer.to("hpu")
+    #transformer = transformer.to("hpu")
     # Prepare everything with our `accelerator`.
     transformer, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         transformer, optimizer, train_dataloader, lr_scheduler
@@ -1241,6 +1357,17 @@ def main(args):
         # Only show the progress bar once on each machine.
         disable=not accelerator.is_local_main_process,
     )
+    
+    def get_sigmas(timesteps, n_dim=4, dtype=torch.float32):
+        sigmas = noise_scheduler_copy.sigmas.to(device=accelerator.device, dtype=dtype)
+        schedule_timesteps = noise_scheduler_copy.timesteps.to(accelerator.device)
+        timesteps = timesteps.to(accelerator.device)
+        step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
+
+        sigma = sigmas[step_indices].flatten()
+        while len(sigma.shape) < n_dim:
+            sigma = sigma.unsqueeze(-1)
+        return sigma    
 
     t0 = None
     t_start = time.perf_counter()
@@ -1256,118 +1383,87 @@ def main(args):
             with accelerator.accumulate(transformer):
                 # Move compute_vae_encoding here to reflect the transformed image input
                 model_input = compute_vae_encodings(batch["pixel_values"], vae)
-                # Sample noise that we'll add to the latents
+                vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
+                bsz, num_channels_latents, height, width = model_input.shape
+                latent_image_ids = _prepare_latent_image_ids(bsz, height // 2, width // 2, accelerator.device, model_input.dtype)
+
+		        # Sample noise that we'll add to the latents
                 noise = torch.randn_like(model_input)
-                if args.noise_offset:
-                    # https://www.crosslabs.org//blog/diffusion-with-offset-noise
-                    rand_device = model_input.device
-                    noise += args.noise_offset * torch.randn(
-                        (model_input.shape[0], model_input.shape[1], 1, 1),
-                        device=rand_device,
-                    )
-                noise = noise.to(model_input.device)
 
-                bsz = model_input.shape[0]
-
-                if args.timestep_bias_strategy == "none":
-                    # Sample a random timestep for each image without bias.
-                    timesteps = torch.randint(
-                        0,
-                        noise_scheduler.config.num_train_timesteps,
-                        (bsz,),
-                        device=model_input.device,
-                    )
-                    timesteps = timesteps.long()
-                else:
-                    # Sample a random timestep for each image, potentially biased by the timestep weights.
-                    # Biasing the timestep weights allows us to spend less time training irrelevant timesteps.
-                    weights = generate_timestep_weights(args, noise_scheduler.config.num_train_timesteps).to(
-                        model_input.device
-                    )
-                    timesteps = torch.multinomial(weights, bsz, replacement=True).long()
-
-                # Add noise to the model input according to the noise magnitude at each timestep
-                # (this is the forward diffusion process)
-                noisy_model_input = noise_scheduler.add_noise(model_input, noise, timesteps)
-
-                # time ids
-                def compute_time_ids(original_size, crops_coords_top_left):
-                    # Adapted from pipeline.StableDiffusionXLPipeline._get_add_time_ids
-                    target_size = (args.resolution, args.resolution)
-                    if "torch.Tensor" in str(type(original_size)):
-                        add_time_ids = torch.cat(
-                            [
-                                original_size,
-                                crops_coords_top_left,
-                                torch.tensor(target_size, device=crops_coords_top_left.device),
-                            ]
-                        )
-                    else:
-                        add_time_ids = list(original_size + crops_coords_top_left + target_size)
-                        add_time_ids = torch.tensor([add_time_ids])
-                    add_time_ids = add_time_ids.to(accelerator.device, dtype=weight_dtype)
-                    return add_time_ids
-
-                add_time_ids = torch.cat(
-                    [compute_time_ids(s, c) for s, c in zip(batch["original_sizes"], batch["crop_top_lefts"])]
+                # Sample a random timestep for each image
+                # for weighting schemes where we sample timesteps non-uniformly
+                u = compute_density_for_timestep_sampling(
+                    weighting_scheme=args.weighting_scheme,
+                    batch_size=bsz,
+                    logit_mean=args.logit_mean,
+                    logit_std=args.logit_std,
+                    mode_scale=args.mode_scale,
                 )
+                indices = (u * noise_scheduler_copy.config.num_train_timesteps).long()
+                timesteps = noise_scheduler_copy.timesteps[indices].to(device=model_input.device)
+
+                # Add noise according to flow matching.
+                # zt = (1 - texp) * x + texp * z1
+                sigmas = get_sigmas(timesteps, n_dim=model_input.ndim, dtype=model_input.dtype)
+                noisy_model_input = (1.0 - sigmas) * model_input + sigmas * noise
+
+                packed_noisy_model_input = FluxPipeline._pack_latents(
+                    noisy_model_input,
+                    batch_size=bsz,
+                    num_channels_latents=num_channels_latents,
+                    height=height,
+                    width=height,
+                )
+
+                # handle guidance
+                if accelerator.unwrap_model(transformer).config.guidance_embeds:
+                    guidance = torch.tensor([args.guidance_scale], device=accelerator.device)
+                    guidance = guidance.expand(bsz)
+                else:
+                    guidance = None
+
                 # Predict the noise residual
-                transformer_added_conditions = {"time_ids": add_time_ids}
-                prompt_embeds = batch["prompt_embeds"].to(accelerator.device)
-                pooled_prompt_embeds = batch["pooled_prompt_embeds"].to(accelerator.device)
-                transformer_added_conditions.update({"text_embeds": pooled_prompt_embeds})
+                prompt_embeds = batch["prompt_embeds"].to(accelerator.device).to(dtype=transformer.dtype)
+
+                pooled_prompt_embeds = batch["pooled_prompt_embeds"].to(accelerator.device).to(dtype=transformer.dtype)
+                #transformer_added_conditions.update({"text_embeds": pooled_prompt_embeds})
                 text_ids = torch.zeros(prompt_embeds.shape[1], 3).to(device=prompt_embeds.device, dtype=prompt_embeds.dtype)
+                latent_image_ids = latent_image_ids.to(accelerator.device, dtype=weight_dtype)
+                timesteps = timesteps.to(accelerator.device, dtype=weight_dtype)
 
                 model_pred = transformer(
-                    noisy_model_input,
-                    timesteps,
-                    prompt_embeds,
-                    text_ids = text_ids,
-                    added_cond_kwargs=transformer_added_conditions,
+                    hidden_states = packed_noisy_model_input,
+                    timestep = timesteps/1000,
+                    guidance=guidance,
+                    pooled_projections = pooled_prompt_embeds,
+                    encoder_hidden_states = prompt_embeds,
+                    txt_ids = text_ids,
+                    img_ids = latent_image_ids,
                     return_dict=False,
                 )[0]
+		        # upscaling height & width as discussed in https://github.com/huggingface/diffusers/pull/9257#discussion_r1731108042
+                model_pred = FluxPipeline._unpack_latents(
+                    model_pred,
+                    height=int(model_input.shape[2] * vae_scale_factor / 2),
+                    width=int(model_input.shape[3] * vae_scale_factor / 2),
+                    vae_scale_factor=vae_scale_factor,
+                )
+                # these weighting schemes use a uniform timestep sampling
+                # and instead post-weight the loss
+                weighting = compute_loss_weighting_for_sd3(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
 
-                # Get the target for loss depending on the prediction type
-                if args.prediction_type is not None:
-                    # set prediction_type of scheduler if defined
-                    noise_scheduler.register_to_config(prediction_type=args.prediction_type)
-
-                if noise_scheduler.config.prediction_type == "epsilon":
-                    target = noise
-                elif noise_scheduler.config.prediction_type == "v_prediction":
-                    target = noise_scheduler.get_velocity(model_input, noise, timesteps)
-                elif noise_scheduler.config.prediction_type == "sample":
-                    # We set the target to latents here, but the model_pred will return the noise sample prediction.
-                    target = model_input
-                    # We will have to subtract the noise residual from the prediction to get the target sample.
-                    model_pred = model_pred - noise
-                else:
-                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-
-                if args.snr_gamma is None:
-                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-                else:
-                    # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
-                    # Since we predict the noise instead of x_0, the original formulation is slightly changed.
-                    # This is discussed in Section 4.2 of the same paper.
-                    snr = compute_snr(noise_scheduler, timesteps)
-                    if noise_scheduler.config.prediction_type == "v_prediction":
-                        # Velocity objective requires that we add one to SNR values before we divide by them.
-                        snr = snr + 1
-                    mse_loss_weights = (
-                        torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(dim=1)[0] / snr
-                    )
-
-                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
-                    loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
-                    loss = loss.mean()
+                # flow matching loss
+                target = noise - model_input
+                # Compute regular loss.
+                loss = torch.mean(
+                    (weighting.float() * (model_pred.float() - target.float()) ** 2).reshape(target.shape[0], -1),
+                    1,
+                )
+                loss = loss.mean()
 
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss / args.gradient_accumulation_steps
-                # Backpropagate
-                # TODO: check why this cause bufferoverflow issue
-                # with torch.autocast(device_type="hpu", dtype=weight_dtype, enabled=True):
                 accelerator.backward(loss)
                 htcore.mark_step()
 
@@ -1388,8 +1484,9 @@ def main(args):
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
+                
 
-                if accelerator.is_main_process:
+                if accelerator.is_main_process or accelerator.distributed_type == GaudiDistributedType.DEEPSPEED:
                     if args.checkpointing_steps is not None and global_step % args.checkpointing_steps == 0:
                         t_chkpt_start = time.perf_counter()
                         # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
@@ -1453,20 +1550,30 @@ def main(args):
                     ema_transformer.copy_to(transformer.parameters())
 
                 # create pipeline
-                if pipeline is None:
-                    pipeline = GaudiFluxPipeline.from_pretrained(
+                pipeline = FluxPipeline.from_pretrained(
                         args.pretrained_model_name_or_path,
                         vae=vae,
                         transformer=unwrap_model(transformer),
                         revision=args.revision,
                         variant=args.variant,
-                        use_habana=True,
-                        use_hpu_graphs=args.use_hpu_graphs_for_inference,
-                        gaudi_config=args.gaudi_config_name,
+                        )
+                '''
+                if pipeline is None:
+                    #pipeline = GaudiFluxPipeline.from_pretrained(
+                    pipeline = FluxPipeline.from_pretrained(
+                        args.pretrained_model_name_or_path,
+                        vae=vae,
+                        transformer=unwrap_model(transformer),
+                        revision=args.revision,
+                        variant=args.variant,
+                        #use_habana=True,
+                        #use_hpu_graphs=args.use_hpu_graphs_for_inference,
+                        #gaudi_config=args.gaudi_config_name,
                     )
                 else:
                     # vae and text encoders are frozen, only need to update transformer
                     pipeline.transformer = unwrap_model(transformer)
+                '''
 
                 pipeline.scheduler = pipeline.scheduler.from_config(noise_scheduler.config)
                 if args.prediction_type is not None:
@@ -1476,7 +1583,15 @@ def main(args):
                 pipeline.set_progress_bar_config(disable=True)
 
                 # run inference
-                generator = torch.Generator(device="cpu").manual_seed(args.seed) if args.seed else None
+                #generator = torch.Generator(device="cpu").manual_seed(args.seed) if args.seed else None
+                if args.seed is not None:
+                    if accelerator.device == torch.device("hpu"):
+                        # torch.Generator() is unsupported on HPU
+                        generator = set_seed(args.seed)
+                    else:
+                        generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
+                else:
+                    generator = None
                 pipeline_args = {"prompt": args.validation_prompt}
 
                 with torch.autocast(
@@ -1488,6 +1603,9 @@ def main(args):
                         pipeline(**pipeline_args, generator=generator, num_inference_steps=25).images[0]
                         for _ in range(args.num_validation_images)
                     ]
+                    for idx,image in enumerate(images):
+                        file_name = f'./png/flux_epoch_{epoch}_idx_{idx}.png'
+                        image.save(file_name)
 
                 for tracker in accelerator.trackers:
                     if tracker.name == "tensorboard":
@@ -1502,6 +1620,9 @@ def main(args):
                                 ]
                             }
                         )
+                #frer pipeline for memory 
+                del pipeline
+                gc.collect()
 
     if t0 is not None:
         duration = time.perf_counter() - t0 - (checkpoint_time if args.adjust_throughput else 0)
@@ -1525,17 +1646,18 @@ def main(args):
             ema_transformer.copy_to(transformer.parameters())
 
         # Serialize pipeline.
-        pipeline = GaudiFluxPipeline.from_pretrained(
+        #pipeline = GaudiFluxPipeline.from_pretrained(
+        pipeline = FluxPipeline.from_pretrained(
             args.pretrained_model_name_or_path,
             transformer=transformer,
             vae=vae,
             revision=args.revision,
             variant=args.variant,
             torch_dtype=weight_dtype,
-            scheduler=noise_scheduler,
-            use_habana=True,
-            use_hpu_graphs=args.use_hpu_graphs_for_inference,
-            gaudi_config=args.gaudi_config_name,
+            #scheduler=noise_scheduler,
+            #use_habana=True,
+            #use_hpu_graphs=args.use_hpu_graphs_for_inference,
+            #gaudi_config=args.gaudi_config_name,
         )
         if args.prediction_type is not None:
             scheduler_args = {"prediction_type": args.prediction_type}
@@ -1546,7 +1668,8 @@ def main(args):
         images = []
         if args.validation_prompt and args.num_validation_images > 0:
             pipeline = pipeline.to(accelerator.device)
-            generator = torch.Generator(device="cpu").manual_seed(args.seed) if args.seed else None
+            #generator = torch.Generator(device="cpu").manual_seed(args.seed) if args.seed else None
+            generator = torch.Generator("cpu").manual_seed(19)
             with torch.autocast(
                 device_type="hpu",
                 dtype=weight_dtype,
@@ -1555,7 +1678,11 @@ def main(args):
                 images = [
                     pipeline(
                         args.validation_prompt,
-                        num_inference_steps=25,
+                        height=1024,
+                        width=1024,
+                        guidance_scale=3.5,
+                        num_inference_steps=32,
+                        max_sequence_length = 512,
                         generator=generator,
                     ).images[0]
                     for _ in range(args.num_validation_images)
@@ -1609,4 +1736,6 @@ def main(args):
 if __name__ == "__main__":
     args = parse_args()
     main(args)
+
+
 
