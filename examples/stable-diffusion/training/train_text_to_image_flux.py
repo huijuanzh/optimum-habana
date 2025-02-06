@@ -1083,6 +1083,9 @@ def main(args):
     text_encoders = [text_encoder_one, text_encoder_two]
     tokenizers = [tokenizer_one, tokenizer_two]
 
+    if args.gradient_checkpointing:
+        transformer.enable_gradient_checkpointing()
+
     def preprocess_train(examples):
         images = [image.convert("RGB") for image in examples[image_column]]
         # image aug
