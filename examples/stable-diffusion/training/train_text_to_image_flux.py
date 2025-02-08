@@ -44,7 +44,7 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 import transformers
 from accelerate.logging import get_logger
-from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration
+from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration, GradientAccumulationPlugin
 from datasets import load_dataset, Dataset
 from diffusers import (
     AutoencoderKL,
@@ -848,9 +848,10 @@ def main(args):
     gaudi_config = GaudiConfig.from_pretrained(args.gaudi_config_name)
     gaudi_config.use_torch_autocast = gaudi_config.use_torch_autocast or args.bf16
 
-
+    ga_plugin = GradientAccumulationPlugin(num_steps=args.gradient_accumulation_steps, sync_each_batch=True)
     accelerator = GaudiAccelerator(
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        #gradient_accumulation_steps=args.gradient_accumulation_steps,
+        gradient_accumulation_plugin = ga_plugin,
         mixed_precision="bf16" if gaudi_config.use_torch_autocast else "no",
         log_with=args.report_to,
         project_config=accelerator_project_config,
