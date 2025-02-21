@@ -843,6 +843,28 @@ def generate_timestep_weights(args, num_timesteps):
 def main(args):
     logging_dir = Path(args.output_dir, args.logging_dir)
 
+    # import correct text encoder classes
+    text_encoder_cls_one = import_model_class_from_model_name_or_path(
+        args.pretrained_model_name_or_path, args.revision
+    )
+    text_encoder_cls_two = import_model_class_from_model_name_or_path(
+        args.pretrained_model_name_or_path, args.revision, subfolder="text_encoder_2"
+    )
+
+    # Check for terminal SNR in combination with SNR Gamma
+    text_encoder_one = text_encoder_cls_one.from_pretrained(
+        args.pretrained_model_name_or_path,
+        subfolder="text_encoder",
+        revision=args.revision,
+        variant=args.variant,
+    )
+    text_encoder_two = text_encoder_cls_two.from_pretrained(
+        args.pretrained_model_name_or_path,
+        subfolder="text_encoder_2",
+        revision=args.revision,
+        variant=args.variant,
+    )
+
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
 
     gaudi_config = GaudiConfig.from_pretrained(args.gaudi_config_name)
@@ -857,6 +879,8 @@ def main(args):
         project_config=accelerator_project_config,
         force_autocast=gaudi_config.use_torch_autocast,
     )
+    text_encoder_one = text_encoder_one.to(accelerator.device)
+    text_encoder_two = text_encoder_two.to(accelerator.device)
 
     if args.report_to == "wandb":
         if not is_wandb_available():
@@ -909,13 +933,6 @@ def main(args):
         use_fast=False,
     )
 
-    # import correct text encoder classes
-    text_encoder_cls_one = import_model_class_from_model_name_or_path(
-        args.pretrained_model_name_or_path, args.revision
-    )
-    text_encoder_cls_two = import_model_class_from_model_name_or_path(
-        args.pretrained_model_name_or_path, args.revision, subfolder="text_encoder_2"
-    )
 
     # Load scheduler and models
     noise_scheduler = GaudiFlowMatchEulerDiscreteScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
@@ -923,19 +940,6 @@ def main(args):
 
     if(args.sdp_on_bf16):
         torch._C._set_math_sdp_allow_fp16_bf16_reduction(True)
-    # Check for terminal SNR in combination with SNR Gamma
-    text_encoder_one = text_encoder_cls_one.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="text_encoder",
-        revision=args.revision,
-        variant=args.variant,
-    ).to(accelerator.device)
-    text_encoder_two = text_encoder_cls_two.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="text_encoder_2",
-        revision=args.revision,
-        variant=args.variant,
-    ).to(accelerator.device)
 
     # For mixed precision training we cast all non-trainable weigths to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
@@ -1117,8 +1121,8 @@ def main(args):
         return examples
 
     with accelerator.main_process_first():
-        if args.max_train_samples is not None:
-            dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
+        #if args.max_train_samples is not None:
+        #    dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
         train_dataset = dataset["train"]
         if len(args.mediapipe) == 0:
             # Set the training transforms
@@ -1172,7 +1176,7 @@ def main(args):
     # DataLoaders creation:
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
-        shuffle=True,
+        shuffle=False,
         collate_fn=collate_fn,
         batch_size=args.train_batch_size,
         num_workers=args.dataloader_num_workers,
