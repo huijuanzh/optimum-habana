@@ -1121,8 +1121,8 @@ def main(args):
         return examples
 
     with accelerator.main_process_first():
-        #if args.max_train_samples is not None:
-        #    dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
+        if args.max_train_samples is not None:
+            dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
         train_dataset = dataset["train"]
         if len(args.mediapipe) == 0:
             # Set the training transforms
