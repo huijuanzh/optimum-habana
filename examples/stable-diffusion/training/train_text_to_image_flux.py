@@ -770,14 +770,22 @@ def encode_prompt(
     return {"prompt_embeds": prompt_embeds, "pooled_prompt_embeds": pooled_prompt_embeds}
 
 
-def compute_vae_encodings(pixel_values, vae):
+def compute_vae_encodings(batch, vae):
+    images = batch.pop("pixel_values")
+    pixel_values = torch.stack(list(images))
     pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
     pixel_values = pixel_values.to(vae.device, dtype=vae.dtype)
+    #print(f'baymax vae encodings pixel_values shape:{pixel_values.shape}')
+    #show_traceback()
+
     with torch.no_grad():
         model_input = vae.encode(pixel_values).latent_dist.sample()
-    model_input = (model_input - vae.config.shift_factor) * vae.config.scaling_factor
-    #model_input = model_input * vae.config.scaling_factor
-    return model_input
+        #print(f' baymax vae encodings  model_input shape:{model_input.shape}')
+    model_input = model_input * vae.config.scaling_factor
+
+    # There might have slightly performance improvement
+    return {"model_input": model_input}
+
 
 def _prepare_latent_image_ids(batch_size, height, width, device, dtype):
     latent_image_ids = torch.zeros(height, width, 3)
@@ -1076,13 +1084,13 @@ def main(args):
 
     text_encoder_one = text_encoder_one.to(accelerator.device, dtype=weight_dtype)
     text_encoder_two = text_encoder_two.to(accelerator.device, dtype=weight_dtype)
+    vae = vae.to(accelerator.device, dtype=weight_dtype)
     # Preprocessing the datasets.
     train_resize = transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR)
     train_crop = transforms.CenterCrop(args.resolution) if args.center_crop else transforms.RandomCrop(args.resolution)
     train_flip = transforms.RandomHorizontalFlip(p=1.0)
     train_transforms = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.5], [0.5])])
 
-    vae = vae.to(accelerator.device, dtype=weight_dtype)
     # Let's first compute all the embeddings so that we can free up the text encoders
     # from memory. We will pre-compute the VAE encodings too.
     text_encoders = [text_encoder_one, text_encoder_two]
@@ -1135,6 +1143,7 @@ def main(args):
         proportion_empty_prompts=args.proportion_empty_prompts,
         caption_column=args.caption_column,
     )
+    compute_vae_encodings_fn = functools.partial(compute_vae_encodings, vae=vae)
 
     # TODO : adding crop = (0,0) for now.
     # If we do random crop, we have to do this in mediapipe
@@ -1152,21 +1161,31 @@ def main(args):
         # fingerprint used by the cache for the other processes to load the result
         # details: https://github.com/huggingface/diffusers/pull/4038#discussion_r1266078401
         new_fingerprint = Hasher.hash(args)
-        train_dataset = train_dataset.map(compute_embeddings_fn, batched=True, batch_size = 32, new_fingerprint=new_fingerprint)
+        train_dataset_with_embeddings = train_dataset.map(compute_embeddings_fn, batched=True, batch_size = 32, new_fingerprint=new_fingerprint)
+        train_dataset_with_vae = train_dataset.map(
+            compute_vae_encodings_fn,
+            batched=True,
+            batch_size=8
+        )
+        precomputed_dataset = concatenate_datasets(
+            [train_dataset_with_embeddings, train_dataset_with_vae.remove_columns(["image", "text"])], axis=1
+        )
+        precomputed_dataset = precomputed_dataset.with_transform(preprocess_train)
+        train_dataset = precomputed_dataset
         if len(args.mediapipe) > 0:
             train_dataset = train_dataset.map(attach_metadata, load_from_cache_file=False)
 
     #print('baymax debug compute embeddings done!')
 
     def collate_fn(examples):
-        pixel_values = torch.stack([example["pixel_values"].clone().detach() for example in examples])
+        model_input = torch.stack([torch.tensor(example["model_input"]) for example in examples])
         original_sizes = [example["original_sizes"] for example in examples]
         crop_top_lefts = [example["crop_top_lefts"] for example in examples]
         prompt_embeds = torch.stack([torch.tensor(example["prompt_embeds"]) for example in examples])
         pooled_prompt_embeds = torch.stack([torch.tensor(example["pooled_prompt_embeds"]) for example in examples])
 
         return {
-            "pixel_values": pixel_values,
+            "model_input": model_input,
             "prompt_embeds": prompt_embeds,
             "pooled_prompt_embeds": pooled_prompt_embeds,
             "original_sizes": original_sizes,
@@ -1390,7 +1409,10 @@ def main(args):
                 t0 = time.perf_counter()
             with accelerator.accumulate(transformer):
                 # Move compute_vae_encoding here to reflect the transformed image input
-                model_input = compute_vae_encodings(batch["pixel_values"], vae)
+                #model_input = compute_vae_encodings(batch["pixel_values"], vae)
+                model_input = batch['model_input']
+                model_input = model_input.to(accelerator.device, dtype=weight_dtype)
+
                 vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
                 bsz, num_channels_latents, height, width = model_input.shape
                 latent_image_ids = _prepare_latent_image_ids(bsz, height // 2, width // 2, accelerator.device, model_input.dtype)
