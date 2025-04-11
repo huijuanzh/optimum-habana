@@ -45,7 +45,7 @@ import torch.utils.checkpoint
 import transformers
 from accelerate.logging import get_logger
 from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration, GradientAccumulationPlugin
-from datasets import load_dataset, Dataset
+from datasets import concatenate_datasets, load_dataset, Dataset
 from diffusers import (
     AutoencoderKL,
     DDPMScheduler,
@@ -850,6 +850,12 @@ def generate_timestep_weights(args, num_timesteps):
 
 def main(args):
     logging_dir = Path(args.output_dir, args.logging_dir)
+    # If passed along, set the training seed now.
+    if args.seed is not None:
+        set_seed(args.seed)
+
+    if(args.sdp_on_bf16):
+        torch._C._set_math_sdp_allow_fp16_bf16_reduction(True)
 
     # import correct text encoder classes
     text_encoder_cls_one = import_model_class_from_model_name_or_path(
@@ -911,9 +917,6 @@ def main(args):
         transformers.utils.logging.set_verbosity_error()
         diffusers.utils.logging.set_verbosity_error()
 
-    # If passed along, set the training seed now.
-    if args.seed is not None:
-        set_seed(args.seed)
 
     # Handle the repository creation
     if accelerator.is_main_process:
@@ -1055,8 +1058,12 @@ def main(args):
         # See more about loading custom images at
         # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
     
-    ds = Dataset.from_dict(dataset['train'][:args.dataset_sz])
-    dataset['train'] = ds
+    if args.dataset_sz > 0:
+        ds = Dataset.from_dict(dataset['train'][:args.dataset_sz])
+        dataset['train'] = ds
+    else:
+        ds = Dataset.from_dict(dataset['train'][:])
+        dataset['train'] = ds
 
 
     # Preprocessing the datasets.
@@ -1396,6 +1403,14 @@ def main(args):
             sigma = sigma.unsqueeze(-1)
         return sigma    
 
+
+    # handle guidance
+    if accelerator.unwrap_model(transformer).config.guidance_embeds:
+        guidance = torch.tensor([args.guidance_scale], device=accelerator.device)
+        guidance = guidance.expand(args.train_batch_size)
+    else:
+        guidance = None
+
     t0 = None
     t_start = time.perf_counter()
     train_loss = torch.tensor(0, dtype=torch.float, device="hpu")
@@ -1409,16 +1424,19 @@ def main(args):
                 t0 = time.perf_counter()
             with accelerator.accumulate(transformer):
                 # Move compute_vae_encoding here to reflect the transformed image input
-                #model_input = compute_vae_encodings(batch["pixel_values"], vae)
-                model_input = batch['model_input']
-                model_input = model_input.to(accelerator.device, dtype=weight_dtype)
-
+                model_input = batch['model_input'].to(accelerator.device)
                 vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
                 bsz, num_channels_latents, height, width = model_input.shape
                 latent_image_ids = _prepare_latent_image_ids(bsz, height // 2, width // 2, accelerator.device, model_input.dtype)
 
 		        # Sample noise that we'll add to the latents
-                noise = torch.randn_like(model_input)
+                noise = torch.randn_like(model_input, device='cpu').to(accelerator.device)
+                if args.noise_offset:
+                    # https://www.crosslabs.org//blog/diffusion-with-offset-noise
+                    noise += args.noise_offset * torch.randn(
+                        (model_input.shape[0], model_input.shape[1], 1, 1), device=model_input.device
+                    )
+
 
                 # Sample a random timestep for each image
                 # for weighting schemes where we sample timesteps non-uniformly
@@ -1434,7 +1452,7 @@ def main(args):
 
                 # Add noise according to flow matching.
                 # zt = (1 - texp) * x + texp * z1
-                sigmas = get_sigmas(timesteps, n_dim=model_input.ndim, dtype=model_input.dtype)
+                sigmas = get_sigmas(timesteps, n_dim=model_input.ndim, dtype=model_input.dtype).cpu()
                 noisy_model_input = (1.0 - sigmas) * model_input + sigmas * noise
 
                 packed_noisy_model_input = FluxPipeline._pack_latents(
@@ -1445,25 +1463,25 @@ def main(args):
                     width=height,
                 )
 
-                # handle guidance
-                if accelerator.unwrap_model(transformer).config.guidance_embeds:
-                    guidance = torch.tensor([args.guidance_scale], device=accelerator.device)
-                    guidance = guidance.expand(bsz)
-                else:
-                    guidance = None
 
                 # Predict the noise residual
                 prompt_embeds = batch["prompt_embeds"].to(accelerator.device).to(dtype=transformer.dtype)
-
                 pooled_prompt_embeds = batch["pooled_prompt_embeds"].to(accelerator.device).to(dtype=transformer.dtype)
-                #transformer_added_conditions.update({"text_embeds": pooled_prompt_embeds})
                 text_ids = torch.zeros(prompt_embeds.shape[1], 3).to(device=prompt_embeds.device, dtype=prompt_embeds.dtype)
                 latent_image_ids = latent_image_ids.to(accelerator.device, dtype=weight_dtype)
+
+                model_input = model_input.to(accelerator.device).to(dtype=transformer.dtype)
+                packed_noisy_model_input = packed_noisy_model_input.to(accelerator.device).to(dtype=transformer.dtype)
+                prompt_embeds = prompt_embeds.to(accelerator.device).to(dtype=transformer.dtype)
+                pooled_prompt_embeds = pooled_prompt_embeds.to(accelerator.device).to(dtype=transformer.dtype)
+                text_ids = text_ids.to(device=prompt_embeds.device, dtype=prompt_embeds.dtype)
+                latent_image_ids = latent_image_ids.to(accelerator.device, dtype=weight_dtype)
+                noise = noise.to(accelerator.device)
                 timesteps = timesteps.to(accelerator.device, dtype=weight_dtype)
 
                 model_pred = transformer(
                     hidden_states = packed_noisy_model_input,
-                    timestep = timesteps/1000,
+                    timestep = timesteps/1000.0,
                     guidance=guidance,
                     pooled_projections = pooled_prompt_embeds,
                     encoder_hidden_states = prompt_embeds,
@@ -1514,6 +1532,8 @@ def main(args):
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
+                if accelerator.is_main_process:
+                    print(f'iter:{global_step:05d} train_loss:{train_loss.item():.4f}')
                 
 
                 if accelerator.is_main_process or accelerator.distributed_type == GaudiDistributedType.DEEPSPEED:
