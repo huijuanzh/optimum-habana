@@ -949,8 +949,6 @@ def main(args):
     noise_scheduler = GaudiFlowMatchEulerDiscreteScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
     noise_scheduler_copy = copy.deepcopy(noise_scheduler)
 
-    if(args.sdp_on_bf16):
-        torch._C._set_math_sdp_allow_fp16_bf16_reduction(True)
 
     # For mixed precision training we cast all non-trainable weigths to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
