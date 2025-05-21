@@ -532,7 +532,7 @@ def setup_distributed_model(args, model_dtype, model_kwargs, logger):
 
     model = deepspeed.init_inference(model, **ds_inference_kwargs)
     model = model.module
-    if model.config.model_type in ["llama", "falcon", "qwen2", "starcoder2", "gemma"]:
+    if model.config.model_type in ["llama", "falcon", "qwen2", "starcoder2", "gemma", "qwen3"]:
         patch_scoped_linear_all_reduce(model)
 
     if args.quant_config:
