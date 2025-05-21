@@ -161,7 +161,7 @@ def _get_input_update_settings(model, lazy_mode: Optional[bool] = None) -> Tuple
     inputs_update: Dict = {}
 
     should_update_inputs = (getattr(model, "generation_config", None) is not None) and (
-        model.config.model_type in ("llama", "qwen2", "starcoder2", "gemma", "baichuan", "chatglm", "deepseek_v2")
+        model.config.model_type in ("llama", "qwen2", "starcoder2", "gemma", "baichuan", "chatglm", "deepseek_v2", "qwen3", "qwen3_moe", "welm_v3", "welm_moe", "mock_llama")
     )
     if should_update_inputs:
         if model.generation_config.attn_softmax_bf16:
@@ -175,7 +175,7 @@ def _get_input_update_settings(model, lazy_mode: Optional[bool] = None) -> Tuple
 
     should_update_inputs = (
         (getattr(model, "generation_config", None) is not None)
-        and (model.config.model_type in ("llama", "qwen2", "starcoder2", "mistral"))
+        and (model.config.model_type in ("llama", "qwen2", "starcoder2", "mistral", "qwen3", "qwen3_moe", "welm_v3", "welm_moe", "mock_llama"))
         and (lazy_mode is not None)
     )
     if should_update_inputs:
