@@ -275,6 +275,8 @@ from .qwen3 import (
     GaudiQwen3Attention,
     GaudiQwen3DecoderLayer,
     GaudiQwen3ForCausalLM,
+    GaudiQwen3ForSequenceClassification,
+    GaudiQwen3ForTokenClassification,
     GaudiQwen3MLP,
     GaudiQwen3Model,
     gaudi_qwen3_rmsnorm_forward,
