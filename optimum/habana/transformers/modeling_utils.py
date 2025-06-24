@@ -175,6 +175,8 @@ from .models import (
     GaudiQwen3MoeAttention,
     GaudiQwen3MoeDecoderLayer,
     GaudiQwen3MoeForCausalLM,
+    GaudiQwen3MoeForSequenceClassification,
+    GaudiQwen3MoeForTokenClassification,
     GaudiQwen3MoeMLP,
     GaudiQwen3MoeSparseMoeBlock,
     GaudiQwen3MoeModel,
@@ -738,6 +740,8 @@ def adapt_transformers_to_gaudi():
     transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeDecoderLayer = GaudiQwen3MoeDecoderLayer
     transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeModel = GaudiQwen3MoeModel
     transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeForCausalLM = GaudiQwen3MoeForCausalLM
+    transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeForSequenceClassification = GaudiQwen3MoeForSequenceClassification
+    transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeForTokenClassification = GaudiQwen3MoeForTokenClassification
     transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeSparseMoeBlock = GaudiQwen3MoeSparseMoeBlock
     transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeRMSNorm.forward = gaudi_qwen3moe_rmsnorm_forward
 
