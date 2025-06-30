@@ -491,6 +491,12 @@ def main():
 
     from optimum.habana.utils import HabanaGenerationTime, get_hpu_memory_stats
 
+    if args.dataset_name == "mlcommons":
+        # Benchmark over the prompts below
+        def get_ds(args):
+            ds = pd.read_pickle(args.mlcommons_dataset)
+            return ds
+
     if args.dataset_name is None:
         # Benchmark over the prompts below
         if args.prompt:
