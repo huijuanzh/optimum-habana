@@ -21,7 +21,12 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
-from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, SequenceClassifierOutputWithPast, TokenClassifierOutput
+from transformers.modeling_outputs import (
+    BaseModelOutputWithPast,
+    CausalLMOutputWithPast,
+    SequenceClassifierOutputWithPast,
+    TokenClassifierOutput,
+)
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen2.modeling_qwen2 import (
     KwargsForCausalLM,
@@ -282,6 +287,7 @@ class GaudiQwen2Attention(Qwen2Attention):
         self.k_cache = KVCache()
         self.v_cache = KVCache()
 
+        self.max_position_embeddings = config.max_position_embeddings
         self.inp_seq_len = -1
 
         self.rotary_emb = GaudiRotaryEmbedding(config=self.config)
@@ -489,6 +495,8 @@ class GaudiQwen2Attention(Qwen2Attention):
 
         if use_flash_attention and FusedSDPA is not None:
             attn_weights = None
+            # Qwen2 Famliy should not use fast/bf16 softmax for SDPA due to its magnitude issue
+            softmax_mode = "None" if self.training else "fp32"
             if q_len == 1:
                 # next token
                 attn_output = fused_scaled_dot_product_attention(
@@ -499,14 +507,13 @@ class GaudiQwen2Attention(Qwen2Attention):
                     0.0,
                     False,
                     None,
-                    "None",
+                    softmax_mode,
                     False,
                     None,
                     "None",
                 )
             else:
                 # first token
-                softmax_mode = "fast" if flash_attention_fast_softmax else "None"
                 if flash_attention_causal_mask:
                     attn_output = fused_scaled_dot_product_attention(
                         query_states,
@@ -1151,6 +1158,8 @@ The only differences are:
 - add new args flash_attention_causal_mask
 - add new args flash_attention_fast_softmax
 """
+
+
 class GaudiQwen2ForSequenceClassification(Qwen2ForSequenceClassification):
     def forward(
         self,

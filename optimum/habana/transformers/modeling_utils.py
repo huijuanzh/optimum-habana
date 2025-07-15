@@ -180,8 +180,8 @@ from .models import (
     GaudiQwen3MoeForSequenceClassification,
     GaudiQwen3MoeForTokenClassification,
     GaudiQwen3MoeMLP,
-    GaudiQwen3MoeSparseMoeBlock,
     GaudiQwen3MoeModel,
+    GaudiQwen3MoeSparseMoeBlock,
     GaudiSiglipAttention,
     GaudiSiglipEncoder,
     GaudiSiglipEncoderLayer,
@@ -225,6 +225,7 @@ from .models import (
     gaudi_BartForConditionalGeneration_prepare_inputs_for_generation,
     gaudi_BartLearnedPositionalEmbedding,
     gaudi_BartModel_forward,
+    gaudi_Bert_Sdpa_SelfAttention_forward,
     gaudi_BertModel_forward,
     gaudi_BlipForConditionalGeneration_generate,
     gaudi_BlipForQuestionAnswering_generate,
@@ -439,6 +440,7 @@ def adapt_transformers_to_gaudi():
     )
 
     # Optimization for BERT on Gaudi
+    transformers.models.bert.modeling_bert.BertSdpaSelfAttention.forward = gaudi_Bert_Sdpa_SelfAttention_forward
     transformers.models.bert.modeling_bert.BertModel.forward = gaudi_BertModel_forward
 
     # Optimization for codegen generation on Gaudi
@@ -739,13 +741,13 @@ def adapt_transformers_to_gaudi():
     transformers.models.qwen3.modeling_qwen3.Qwen3RMSNorm.forward = gaudi_qwen3_rmsnorm_forward
 
     # Optimization for qwen3Moe on Gaudi
-    transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeMLP = GaudiQwen3MoeMLP
-    transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeAttention = GaudiQwen3MoeAttention
-    transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeDecoderLayer = GaudiQwen3MoeDecoderLayer
-    transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeModel = GaudiQwen3MoeModel
     transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeForCausalLM = GaudiQwen3MoeForCausalLM
+    transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeModel = GaudiQwen3MoeModel
     transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeForSequenceClassification = GaudiQwen3MoeForSequenceClassification
     transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeForTokenClassification = GaudiQwen3MoeForTokenClassification
+    transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeAttention = GaudiQwen3MoeAttention
+    transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeMLP = GaudiQwen3MoeMLP
+    transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeDecoderLayer = GaudiQwen3MoeDecoderLayer
     transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeSparseMoeBlock = GaudiQwen3MoeSparseMoeBlock
     transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeRMSNorm.forward = gaudi_qwen3moe_rmsnorm_forward
 
