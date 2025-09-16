@@ -296,6 +296,14 @@ from .qwen3_moe import (
     GaudiQwen3MoeSparseMoeBlock,
     gaudi_qwen3moe_rmsnorm_forward,
 )
+from .janus import (
+    GaudiJanusVisionAttention,
+    GaudiJanusVisionEncoderLayer,
+    GaudiJanusVisionEncoder,
+    GaudiJanusVisionModel,
+    GaudiJanusModel,
+    GaudiJanusForConditionalGeneration,
+)
 from .seamless_m4t import (
     gaudi_SeamlessM4TAttention_forward,
     gaudi_SeamlessM4TCodeHifiGan_get_output_hifigan_lengths,

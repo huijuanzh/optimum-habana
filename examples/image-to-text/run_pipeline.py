@@ -259,7 +259,7 @@ def main():
     config = AutoConfig.from_pretrained(args.model_name_or_path)
     model_type = config.model_type
 
-    if args.image_path is None and model_type in ["llava", "idefics2", "mllama", "qwen2_vl", "chatglm"]:
+    if args.image_path is None and model_type in ["llava", "idefics2", "mllama", "qwen2_vl", "chatglm", "janus"]:
         args.image_path = ["https://llava-vl.github.io/static/images/view.jpg"]
     elif args.image_path is None and model_type == "paligemma":
         args.image_path = [
@@ -280,6 +280,7 @@ def main():
         "paligemma",
         "qwen2_vl",
         "chatglm",
+        "janus",
         "llava_onevision",
     ]:
         processor = AutoProcessor.from_pretrained(args.model_name_or_path, padding_side="left")
@@ -338,7 +339,12 @@ def main():
     images = []
 
     for image_path in image_paths:
-        images.append(PIL.Image.open(requests.get(image_path, stream=True, timeout=3000).raw))
+        if image_path.startswith("http://") or image_path.startswith("https://"):
+            images.append(PIL.Image.open(requests.get(image_path, stream=True, timeout=3000).raw))
+        elif os.path.exists(image_path):
+            images.append(PIL.Image.open(image_path))
+        else:
+            raise ValueError(f"Image {image_path} doesn't exist!")
 
     import torch
 
@@ -418,6 +424,10 @@ def main():
     if model_type == "chatglm":
         generate_kwargs["reuse_cache"] = True
 
+    if model_type == "janus":
+        generate_kwargs["use_cache"] = True
+        generate_kwargs["cache_implementation"] = "static"
+
     if args.quant_config:
         generator.model = setup_quantization(generator.model, args)
         htcore.hpu_initialize(generator.model)
@@ -433,6 +443,7 @@ def main():
         "llava",
         "llava_next",
         "chatglm",
+        "janus",
         "llava_onevision",
     ]:
         from transformers.image_utils import load_image

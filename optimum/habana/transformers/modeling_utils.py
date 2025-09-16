@@ -174,6 +174,12 @@ from .models import (
     GaudiQwen3MoeMLP,
     GaudiQwen3MoeModel,
     GaudiQwen3MoeSparseMoeBlock,
+    GaudiJanusVisionAttention,
+    GaudiJanusVisionEncoderLayer,
+    GaudiJanusVisionEncoder,
+    GaudiJanusVisionModel,
+    GaudiJanusModel,
+    GaudiJanusForConditionalGeneration,
     GaudiSiglipAttention,
     GaudiSiglipEncoder,
     GaudiSiglipEncoderLayer,
@@ -726,6 +732,14 @@ def adapt_transformers_to_gaudi():
     transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeDecoderLayer = GaudiQwen3MoeDecoderLayer
     transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeSparseMoeBlock = GaudiQwen3MoeSparseMoeBlock
     transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeRMSNorm.forward = gaudi_qwen3moe_rmsnorm_forward
+
+    # Optimization for Janus on Gaudi
+    transformers.models.janus.modeling_janus.JanusVisionAttention = GaudiJanusVisionAttention
+    transformers.models.janus.modeling_janus.JanusVisionEncoderLayer = GaudiJanusVisionEncoderLayer
+    transformers.models.janus.modeling_janus.JanusVisionEncoder = GaudiJanusVisionEncoder
+    transformers.models.janus.modeling_janus.JanusVisionModel = GaudiJanusVisionModel
+    transformers.models.janus.modeling_janus.JanusModel = GaudiJanusModel
+    transformers.models.janus.modeling_janus.JanusForConditionalGeneration = GaudiJanusForConditionalGeneration
 
     # Optimization for stablelm on Gaudi
     transformers.models.stablelm.modeling_stablelm.StableLmAttention = GaudiStableLmAttention
