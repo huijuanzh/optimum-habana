@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import inspect
+import math
 import functools
 from typing import Any, Callable, Dict, List, Optional, Union
 import types
@@ -21,9 +22,11 @@ import torch
 from transformers import (
     Qwen2_5_VLForConditionalGeneration,
     Qwen2Tokenizer,
+    Qwen2VLProcessor
 )
 
 #from ...image_processor import PipelineImageInput, VaeImageProcessor
+from diffusers.image_processor import PipelineImageInput
 from diffusers.models import AutoencoderKLQwenImage, QwenImageTransformer2DModel
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils import (
@@ -46,6 +49,8 @@ EXAMPLE_DOC_STRING = """
     Examples:
         ```python
         >>> import torch
+        >>> from PIL import Image
+        >>> from diffusers.utils import load_image
         >>> from optimum.habana.diffusers import GaudiQwenImageEditPipeline
 
         >>> pipe = GaudiQwenImageEditPipeline.from_pretrained(
@@ -56,11 +61,16 @@ EXAMPLE_DOC_STRING = """
         ...     gaudi_config="Habana/stable-diffusion",
         ... )
 
-        >>> prompt = "change the text to read 'Qwen Image Edit is here'"
+        >>> image = load_image(
+        ...     "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/yarn-art-pikachu.png"
+        ... ).convert("RGB")
+        >>> prompt = (
+        ...     "Make Pikachu hold a sign that says 'Qwen Edit is awesome', yarn art style, detailed, vibrant colors"
+        ... )
         >>> # Depending on the variant being used, the pipeline call will slightly vary.
         >>> # Refer to the pipeline documentation for more details.
-        >>> image = pipe(prompt, num_inference_steps=50).images[0]
-        >>> image.save("qwenimageedit.png")
+        >>> image = pipe(image, prompt, num_inference_steps=50).images[0]
+        >>> image.save("qwenimage_edit.png")
         ```
 """
 
@@ -185,9 +195,19 @@ class GaudiQwenEmbedRope(torch.nn.Module):
         return freqs_cos.clone().contiguous(), freqs_sin.clone().contiguous()
 
 
+def calculate_dimensions(target_area, ratio):
+    width = math.sqrt(target_area * ratio)
+    height = width / ratio
+
+    width = round(width / 32) * 32
+    height = round(height / 32) * 32
+
+    return width, height, None
+
+
 class GaudiQwenImageEditPipeline(GaudiDiffusionPipeline, QwenImageEditPipeline):
     r"""
-    Adapted from: https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/qwenimage/pipeline_qwenimage.py#L132
+    Adapted from: https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/qwenimage/pipeline_qwenimage_edit.py#L165
 
     This class inherits from `QwenImageEditPipeline` and overrides methods to use Gaudi-specific implementations.
     add args use_habana
@@ -205,6 +225,7 @@ class GaudiQwenImageEditPipeline(GaudiDiffusionPipeline, QwenImageEditPipeline):
         text_encoder: Qwen2_5_VLForConditionalGeneration,
         tokenizer: Qwen2Tokenizer,
         transformer: QwenImageTransformer2DModel,
+        processor: Qwen2VLProcessor,
         use_habana: bool = False,
         use_hpu_graphs: bool = False,
         gaudi_config: Union[str, GaudiConfig] = None,
@@ -227,6 +248,7 @@ class GaudiQwenImageEditPipeline(GaudiDiffusionPipeline, QwenImageEditPipeline):
             text_encoder=text_encoder,
             tokenizer=tokenizer,
             transformer=transformer,
+            processor=processor,
         )
         self.to(self._device)
         self.transformer.forward = types.MethodType(QwenImageTransformer2DModelGaudi, self.transformer)
