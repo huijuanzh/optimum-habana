@@ -9,7 +9,7 @@ from transformers.modeling_outputs import (
     BaseModelOutputWithPoolingAndCrossAttentions,
     CausalLMOutputWithCrossAttentions,
 )
-from transformers.modeling_utils import apply_chunking_to_forward
+from transformers.pytorch_utils import apply_chunking_to_forward
 from transformers.utils import logging
 
 

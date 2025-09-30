@@ -27,7 +27,8 @@ from transformers.cache_utils import (
     Cache,
     DynamicCache,
     EncoderDecoderCache,
-    OffloadedCache,
+    QuantizedCache,
+    StaticCache,
 )
 from transformers.generation.beam_constraints import DisjunctiveConstraint, PhrasalConstraint
 from transformers.generation.beam_search import BeamScorer, BeamSearchScorer, ConstrainedBeamSearchScorer
@@ -41,7 +42,7 @@ from transformers.generation.candidate_generator import (
     _prepare_attention_mask,
     _prepare_token_type_ids,
 )
-from transformers.generation.configuration_utils import NEED_SETUP_CACHE_CLASSES_MAPPING, QUANT_BACKEND_CLASSES_MAPPING
+from transformers.generation.configuration_utils import ALL_CACHE_IMPLEMENTATIONS
 from transformers.generation.logits_process import LogitsProcessorList
 from transformers.generation.stopping_criteria import (
     ConfidenceCriteria,
@@ -62,8 +63,9 @@ from transformers.generation.utils import (
     GenerateOutput,
     GenerationMixin,
     GenerationMode,
-    _split_model_outputs,
-    stack_model_outputs,
+    _split_model_outputs, 
+    #stack_model_outputs,
+    GENERATION_MODES_MAPPING,
 )
 from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
 from transformers.integrations.fsdp import is_fsdp_managed_module
@@ -131,6 +133,7 @@ MODELS_OPTIMIZED_WITH_STATIC_SHAPES = [
     "qwen2_vl",
     "qwen3",
     "qwen3_moe",
+    "qwen3_next"
 ]
 
 # Initial generated token index is set to 1 to accomodate SOS (start of string) token.
@@ -1122,7 +1125,7 @@ class GaudiGenerationMixin(GenerationMixin):
         #     self.config.get_text_config(decoder=True), "cache_implementation", None
         # )
         if generation_config.cache_implementation is not None:
-            if generation_config.cache_implementation in NEED_SETUP_CACHE_CLASSES_MAPPING:
+            if generation_config.cache_implementation in ALL_CACHE_IMPLEMENTATIONS:
                 if generation_config.cache_implementation == "static" and not self._can_compile_fullgraph:
                     raise ValueError(
                         "This model does not support `cache_implementation='static'`. Please check the following "
@@ -1147,7 +1150,6 @@ class GaudiGenerationMixin(GenerationMixin):
                     if generation_config.cache_config is not None
                     else {"backend": "quanto"}
                 )
-                cache_class = QUANT_BACKEND_CLASSES_MAPPING[cache_config["backend"]]
 
                 if cache_config["backend"] == "quanto" and not is_optimum_quanto_available():
                     raise ImportError(
@@ -1160,9 +1162,9 @@ class GaudiGenerationMixin(GenerationMixin):
                         "Please install it via  with `pip install hqq`"
                     )
 
-                model_kwargs[cache_name] = cache_class(**cache_config)
+                model_kwargs[cache_name] = QuantizedCache(backend=backend, **cache_config)
             elif generation_config.cache_implementation == "offloaded":
-                model_kwargs[cache_name] = OffloadedCache()
+                model_kwargs[cache_name] = DynamicCache(**dynamic_cache_kwargs, offloading=True)
             elif generation_config.cache_implementation == "dynamic":
                 model_kwargs[cache_name] = DynamicCache()
 
@@ -1301,7 +1303,7 @@ class GaudiGenerationMixin(GenerationMixin):
 
         # 0. If requested, load an arbitrary generation recipe from the Hub and run it instead
         trust_remote_code = kwargs.pop("trust_remote_code", None)
-        if custom_generate is not None:
+        if custom_generate is not None and isinstance(custom_generate, str):
             # Get all `generate` arguments in a single variable. Custom functions are responsible for handling them:
             # they receive the same inputs as `generate`, with `model` instead of `self` and excluding the arguments to
             # trigger the custom generation. They can access to methods from `GenerationMixin` through `model`.
@@ -1321,6 +1323,13 @@ class GaudiGenerationMixin(GenerationMixin):
             return custom_generate_function(model=self, **generate_arguments)
 
         # 1. Handle `generation_config` and kwargs that might update it, and validate the `.generate()` call
+        generation_mode_kwargs = self._extract_generation_mode_kwargs(
+            custom_generate,
+            kwargs,
+            synced_gpus,
+            assistant_model,
+            streamer,
+        )
         tokenizer = kwargs.pop("tokenizer", None)  # Pull this out first, we only use it for stopping criteria
         assistant_tokenizer = kwargs.pop("assistant_tokenizer", None)  # only used for assisted generation
         if hpu_graphs and not lazy_mode:
@@ -1331,8 +1340,15 @@ class GaudiGenerationMixin(GenerationMixin):
         generation_config, model_kwargs = self._prepare_generation_config(
             generation_config, use_model_defaults, **kwargs
         )
+        generation_mode = generation_config.get_generation_mode(assistant_model)
+        if isinstance(custom_generate, Callable):
+            decoding_method = custom_generate
+        else:
+            # type() required to access the unbound class-level method
+            decoding_method = getattr(type(self), GENERATION_MODES_MAPPING[generation_mode])
         self._validate_model_kwargs(model_kwargs.copy())
-        self._validate_assistant(assistant_model, tokenizer, assistant_tokenizer)
+        #self._validate_assistant(assistant_model, tokenizer, assistant_tokenizer)
+        self._validate_generation_mode(generation_mode, generation_config, generation_mode_kwargs)
 
         # 2. Set generation parameters if not already defined
         if synced_gpus is None:
@@ -1349,6 +1365,9 @@ class GaudiGenerationMixin(GenerationMixin):
         inputs_tensor, model_input_name, model_kwargs = self._prepare_model_inputs(
             inputs, generation_config.bos_token_id, model_kwargs
         )
+        # Some generation modes (e.g. assisted) need `inputs_tensor` to rerun encoder.forward()
+        if "inputs_tensor" in inspect.signature(decoding_method).parameters.keys():
+            generation_mode_kwargs["inputs_tensor"] = inputs_tensor
         batch_size = inputs_tensor.shape[0]
 
         device = inputs_tensor.device
@@ -1783,35 +1802,33 @@ class GaudiGenerationMixin(GenerationMixin):
                 streamer=streamer,
                 **model_kwargs,
             )
+        # elif generation_mode == GenerationMode.CONTRASTIVE_SEARCH:
+        #     if not trust_remote_code:
+        #         logger.warning_once(
+        #             "Contrastive Search is scheduled to be moved to a `custom_generate` repository in v4.55.0. "
+        #             "To prevent loss of backward compatibility, add `trust_remote_code=True` to your `generate` call."
+        #         )
+        #     if not model_kwargs["use_cache"]:
+        #         raise ValueError("Contrastive search requires `use_cache=True`")
+        #     if self._is_stateful:
+        #         # Just like assisted generation, we need to be able to rollback to a previous state (see comment above)
+        #         raise ValueError(
+        #             f"contrastive search is not supported with stateful models, such as {self.__class__.__name__}"
+        #         )
 
-        elif generation_mode == GenerationMode.CONTRASTIVE_SEARCH:
-            if not trust_remote_code:
-                logger.warning_once(
-                    "Contrastive Search is scheduled to be moved to a `custom_generate` repository in v4.55.0. "
-                    "To prevent loss of backward compatibility, add `trust_remote_code=True` to your `generate` call."
-                )
-            if not model_kwargs["use_cache"]:
-                raise ValueError("Contrastive search requires `use_cache=True`")
-            if self._is_stateful:
-                # Just like assisted generation, we need to be able to rollback to a previous state (see comment above)
-                raise ValueError(
-                    f"contrastive search is not supported with stateful models, such as {self.__class__.__name__}"
-                )
-
-            result = self._contrastive_search(
-                input_ids,
-                logits_processor=prepared_logits_processor,
-                stopping_criteria=prepared_stopping_criteria,
-                generation_config=generation_config,
-                synced_gpus=synced_gpus,
-                streamer=streamer,
-                lazy_mode=lazy_mode,
-                ignore_eos=generation_config.ignore_eos,
-                profiler=profiler,
-                hb_gen_time=hb_gen_time,
-                **model_kwargs,
-            )
-
+        #     result = self._contrastive_search(
+        #         input_ids,
+        #         logits_processor=prepared_logits_processor,
+        #         stopping_criteria=prepared_stopping_criteria,
+        #         generation_config=generation_config,
+        #         synced_gpus=synced_gpus,
+        #         streamer=streamer,
+        #         lazy_mode=lazy_mode,
+        #         ignore_eos=generation_config.ignore_eos,
+        #         profiler=profiler,
+        #         hb_gen_time=hb_gen_time,
+        #         **model_kwargs,
+        #     )
         elif generation_mode in (GenerationMode.SAMPLE, GenerationMode.GREEDY_SEARCH):
             # 11. expand input_ids with `num_return_sequences` additional sequences per batch
             input_ids, model_kwargs = self._expand_inputs_for_generation(
@@ -2045,7 +2062,7 @@ class GaudiGenerationMixin(GenerationMixin):
         """
 
         raise NotImplementedError("Dola decoding is not supported by optimum-habana yet.")
-
+    '''
     @torch.no_grad()
     def _contrastive_search(
         self,
@@ -2648,7 +2665,7 @@ class GaudiGenerationMixin(GenerationMixin):
                 )
         else:
             return input_ids
-
+    '''
     def _sample(
         self,
         input_ids: torch.LongTensor,

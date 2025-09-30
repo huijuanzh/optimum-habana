@@ -20,12 +20,14 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any, Optional, Union
 
+from functools import cached_property
 import torch.distributed as dist
 from accelerate import DistributedType, PartialState
 from accelerate.state import AcceleratorState
 from optimum.utils import logging
 from transformers.debug_utils import DebugOption
-from transformers.file_utils import cached_property, is_torch_available, requires_backends
+#from transformers.file_utils import cached_property, is_torch_available, requires_backends
+from transformers.file_utils import is_torch_available, requires_backends
 from transformers.trainer_pt_utils import AcceleratorConfig
 from transformers.trainer_utils import (
     EvaluationStrategy,
