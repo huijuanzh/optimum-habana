@@ -296,6 +296,17 @@ from .qwen3_moe import (
     GaudiQwen3MoeSparseMoeBlock,
     gaudi_qwen3moe_rmsnorm_forward,
 )
+from .qwen3_next import (
+    GaudiQwen3NextAttention,
+    GaudiQwen3NextMLP,
+    GaudiQwen3NextDecoderLayer,
+    GaudiQwen3NextForCausalLM,
+    GaudiQwen3NextModel,
+    GaudiQwen3NextSparseMoeBlock,
+    GaudiQwen3NextGatedDeltaNet,
+    gaudi_qwen3next_rmsnorm_forward,
+    gaudi_qwen3next_rmsnorm_gated_forward,
+)
 from .seamless_m4t import (
     gaudi_SeamlessM4TAttention_forward,
     gaudi_SeamlessM4TCodeHifiGan_get_output_hifigan_lengths,

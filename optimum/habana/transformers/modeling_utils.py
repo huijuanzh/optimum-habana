@@ -178,6 +178,13 @@ from .models import (
     GaudiQwen3MoeMLP,
     GaudiQwen3MoeModel,
     GaudiQwen3MoeSparseMoeBlock,
+    GaudiQwen3NextAttention,
+    GaudiQwen3NextMLP,
+    GaudiQwen3NextDecoderLayer,
+    GaudiQwen3NextForCausalLM,
+    GaudiQwen3NextModel,
+    GaudiQwen3NextSparseMoeBlock,
+    GaudiQwen3NextGatedDeltaNet,
     GaudiSiglipAttention,
     GaudiSiglipEncoder,
     GaudiSiglipEncoderLayer,
@@ -279,6 +286,8 @@ from .models import (
     gaudi_qwen2moe_rmsnorm_forward,
     gaudi_qwen3_rmsnorm_forward,
     gaudi_qwen3moe_rmsnorm_forward,
+    gaudi_qwen3next_rmsnorm_forward,
+    gaudi_qwen3next_rmsnorm_gated_forward,
     gaudi_rot_matmul,
     gaudi_rot_vec_mul,
     gaudi_SeamlessM4TAttention_forward,
@@ -387,7 +396,7 @@ def adapt_transformers_to_gaudi():
     transformers.generation.GenerationMixin._beam_search = GaudiGenerationMixin._beam_search
     transformers.generation.GenerationMixin._group_beam_search = GaudiGenerationMixin._group_beam_search
     transformers.generation.GenerationMixin._constrained_beam_search = GaudiGenerationMixin._constrained_beam_search
-    transformers.generation.GenerationMixin._contrastive_search = GaudiGenerationMixin._contrastive_search
+    #transformers.generation.GenerationMixin._contrastive_search = GaudiGenerationMixin._contrastive_search
     transformers.generation.GenerationMixin._assisted_decoding = GaudiGenerationMixin._assisted_decoding
     transformers.generation.GenerationMixin._get_candidate_generator = GaudiGenerationMixin._get_candidate_generator
     transformers.generation.GenerationMixin._prepare_cache_for_generation = (
@@ -739,6 +748,17 @@ def adapt_transformers_to_gaudi():
     transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeDecoderLayer = GaudiQwen3MoeDecoderLayer
     transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeSparseMoeBlock = GaudiQwen3MoeSparseMoeBlock
     transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeRMSNorm.forward = gaudi_qwen3moe_rmsnorm_forward
+
+    # Optimization for Qwen3Next on Gaudi
+    transformers.models.qwen3_next.modeling_qwen3_next.Qwen3NextAttention = GaudiQwen3NextAttention
+    transformers.models.qwen3_next.modeling_qwen3_next.Qwen3NextMLP = GaudiQwen3NextMLP
+    transformers.models.qwen3_next.modeling_qwen3_next.Qwen3NextDecoderLayer = GaudiQwen3NextDecoderLayer
+    transformers.models.qwen3_next.modeling_qwen3_next.Qwen3NextForCausalLM = GaudiQwen3NextForCausalLM
+    transformers.models.qwen3_next.modeling_qwen3_next.Qwen3NextModel = GaudiQwen3NextModel
+    transformers.models.qwen3_next.modeling_qwen3_next.Qwen3NextSparseMoeBlock = GaudiQwen3NextSparseMoeBlock
+    transformers.models.qwen3_next.modeling_qwen3_next.Qwen3NextGatedDeltaNet = GaudiQwen3NextGatedDeltaNet
+    transformers.models.qwen3_next.modeling_qwen3_next.Qwen3NextRMSNorm.forward = gaudi_qwen3next_rmsnorm_forward
+    transformers.models.qwen3_next.modeling_qwen3_next.Qwen3NextRMSNormGated.forward = gaudi_qwen3next_rmsnorm_gated_forward
 
     # Optimization for stablelm on Gaudi
     transformers.models.stablelm.modeling_stablelm.StableLmAttention = GaudiStableLmAttention
