@@ -1106,13 +1106,16 @@ class GaudiQwen3NextDecoderLayer(Qwen3NextDecoderLayer):
         self.post_attention_layernorm = Qwen3NextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def allocate_kv_cache(self, batch_size, max_seq_len, inp_seq_len):
-        self.self_attn.allocate_kv_cache(batch_size, max_seq_len, inp_seq_len)
+        if self.layer_type == "full_attention":
+            self.self_attn.allocate_kv_cache(batch_size, max_seq_len, inp_seq_len)
 
     def reorder_kv_cache(self, beam_idx: torch.LongTensor):
-        return self.self_attn.reorder_kv_cache(beam_idx)
+        if self.layer_type == "full_attention":
+            return self.self_attn.reorder_kv_cache(beam_idx)
 
     def update_sincos_cache(self, seq_len):
-        self.self_attn.update_sincos_cache(seq_len)
+        if self.layer_type == "full_attention":
+            self.self_attn.update_sincos_cache(seq_len)
 
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
