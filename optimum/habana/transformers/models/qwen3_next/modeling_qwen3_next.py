@@ -229,6 +229,16 @@ class ModuleFusedSDPA(torch.nn.Module):
             padding_side,
         )
 
+def gaudi_apply_mask_to_padding_states(hidden_states, attention_mask):
+    """
+    Tunes out the hidden states for padding tokens, see https://github.com/state-spaces/mamba/issues/66
+    """
+    #if attention_mask is not None and attention_mask.shape[1] > 1 and attention_mask.shape[0] > 1:# why need bs >1??
+    if attention_mask is not None and attention_mask.shape[1] > 1:
+        dtype = hidden_states.dtype
+        hidden_states = (hidden_states * attention_mask[:, :, None]).to(dtype)
+
+    return hidden_states
 
 def gaudi_eager_attention_forward(
     module: torch.nn.Module,
@@ -274,11 +284,12 @@ def gaudi_tpc_torch_causal_conv1d_update(
     _, hidden_size, seq_len = hidden_states.shape
     state_len = conv_state.shape[-1]
 
-    hidden_states_new = torch.cat([conv_state, hidden_states], dim=-1).to(weight.dtype)
+    hidden_states_new = torch.cat([conv_state, hidden_states], dim=-1).to(torch.float32)
     conv_state.copy_(hidden_states_new[:, :, -state_len:])
     #out = F.conv1d(hidden_states_new, weight.unsqueeze(1), bias, padding=0, groups=hidden_size)
+    out = F.conv1d(hidden_states_new, weight.unsqueeze(1).float(), bias, padding=0, groups=hidden_size)
     #optimize conv1d with tpc
-    out = (conv_state[:, 1:, :] * weight[0:-1, :].unsqueeze(0)).sum(dim=1) + hidden_states.squeeze(1) * weight[-1, :].unsqueeze(0)
+    #out = (conv_state[:, 1:, :] * weight[0:-1, :].unsqueeze(0)).sum(dim=1) + hidden_states.squeeze(1) * weight[-1, :].unsqueeze(0)
     out = F.silu(out[:, :, -seq_len:])
     out = out.to(hidden_states.dtype)
     return out
@@ -337,7 +348,8 @@ def gaudi_torch_chunk_gated_delta_rule(
     value = attn @ v_beta
     k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
     last_recurrent_state = (
-        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim).to(value)
+        #torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim).to(value)
+        torch.zeros((batch_size, num_heads, k_head_dim, v_head_dim), dtype=torch.float32).to(value)
         if initial_state is None
         else initial_state.to(value)
     )
@@ -383,7 +395,8 @@ def gaudi_torch_recurrent_gated_delta_rule(
 
     core_attn_out = torch.zeros(batch_size, num_heads, sequence_length, v_head_dim).to(value)
     last_recurrent_state = (
-        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim).to(value)
+        #torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim).to(value)
+        torch.zeros((batch_size, num_heads, k_head_dim, v_head_dim), dtype=torch.float32).to(value)
         if initial_state is None
         else initial_state.to(value)
     )
@@ -425,7 +438,7 @@ class GaudiQwen3NextGatedDeltaNet(Qwen3NextGatedDeltaNet):
         use_cache: Optional[bool] = None,
         position_ids: Optional[torch.LongTensor] = None,
     ):
-        hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
+        hidden_states = gaudi_apply_mask_to_padding_states(hidden_states, attention_mask)
 
         # Set up dimensions for reshapes later
         batch_size, seq_len, _ = hidden_states.shape
@@ -467,7 +480,12 @@ class GaudiQwen3NextGatedDeltaNet(Qwen3NextGatedDeltaNet):
             )
         else:
             if use_cache:
-                conv_state = F.pad(mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0))
+                if attention_mask is not None:
+                    ori_len = attention_mask.sum(dim=1).max().item()   #TODO: consider bs>1 case for different seq lens
+                    pad_len = seq_len - ori_len
+                    conv_state = F.pad(mixed_qkv, (self.conv_kernel_size - ori_len, -pad_len)).float()
+                else:
+                    conv_state = F.pad(mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0))
                 self.conv_state = conv_state
             #if cache_params is not None:
             #    conv_state = F.pad(mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0))
@@ -527,7 +545,6 @@ class GaudiQwen3NextGatedDeltaNet(Qwen3NextGatedDeltaNet):
                 output_final_state=cache_params is not None,
                 use_qk_l2norm_in_kernel=True,
             )
-
         # Update cache
         #if cache_params is not None:
         #    cache_params.recurrent_states[self.layer_idx] = last_recurrent_state
@@ -1494,8 +1511,7 @@ class GaudiQwen3NextModel(Qwen3NextModel):
                 past_key_values=past_seen_tokens,
                 position_ids=position_ids,
             )
-        #linear_attn_mask = self._update_linear_attn_mask(attention_mask, cache_position)
-        linear_attn_mask = None  # HPU 
+        linear_attn_mask = self._update_linear_attn_mask(attention_mask, position_ids.squeeze(0))
 
         # embed positions
         hidden_states = inputs_embeds
