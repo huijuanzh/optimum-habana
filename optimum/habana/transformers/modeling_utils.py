@@ -757,8 +757,8 @@ def adapt_transformers_to_gaudi():
     transformers.models.qwen3_next.modeling_qwen3_next.Qwen3NextModel = GaudiQwen3NextModel
     transformers.models.qwen3_next.modeling_qwen3_next.Qwen3NextSparseMoeBlock = GaudiQwen3NextSparseMoeBlock
     transformers.models.qwen3_next.modeling_qwen3_next.Qwen3NextGatedDeltaNet = GaudiQwen3NextGatedDeltaNet
-    transformers.models.qwen3_next.modeling_qwen3_next.Qwen3NextRMSNorm.forward = gaudi_qwen3next_rmsnorm_forward
-    transformers.models.qwen3_next.modeling_qwen3_next.Qwen3NextRMSNormGated.forward = gaudi_qwen3next_rmsnorm_gated_forward
+    #transformers.models.qwen3_next.modeling_qwen3_next.Qwen3NextRMSNorm.forward = gaudi_qwen3next_rmsnorm_forward
+    #transformers.models.qwen3_next.modeling_qwen3_next.Qwen3NextRMSNormGated.forward = gaudi_qwen3next_rmsnorm_gated_forward
 
     # Optimization for stablelm on Gaudi
     transformers.models.stablelm.modeling_stablelm.StableLmAttention = GaudiStableLmAttention
