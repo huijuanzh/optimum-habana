@@ -24,6 +24,7 @@ from typing import Optional, Union
 import copy
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 from torch.distributed.distributed_c10d import ProcessGroup
@@ -59,6 +60,7 @@ from transformers.utils.deprecation import deprecate_kwarg
 from transformers.processing_utils import Unpack
 
 from ....distributed import parallel_state
+from ....distributed.tensorparallel import _all_reduce
 from .... import distributed
 from ....distributed import parallel_state
 from ....distributed.strategy import DistributedStrategy, NoOpStrategy
@@ -940,11 +942,45 @@ def _is_deepspeed_initialized(self) -> bool:
     return dist.is_initialized() and any(isinstance(m, LinearAllreduce) for _, m in self.named_modules())
 
 class GaudiQwen3NextSparseMoeBlock(Qwen3NextSparseMoeBlock):
-    """
-    def __init__(self, config: Qwen3NextConfig):
+
+    def __init__(self, config):
         super().__init__(config)
         self.num_experts = config.num_experts
-    """
+        self.top_k = config.num_experts_per_tok
+        self.norm_topk_prob = config.norm_topk_prob
+
+        self.ep_size = config.ep_size if hasattr(config, "ep_size") else 1
+        if dist.is_initialized():
+            self.world_size = dist.get_world_size()
+        else:
+            self.world_size = 1
+
+        # gating
+        self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
+        if self.ep_size > 1:
+            assert config.ep_size == dist.get_world_size()
+            ep_rank = dist.get_rank()
+            experts_per_rank = self.num_experts // self.ep_size
+
+            self.experts_min = experts_per_rank * ep_rank
+            self.experts_max = experts_per_rank * (ep_rank + 1) - 1
+            self.experts_range = range(self.experts_min, self.experts_max + 1)
+
+            self.experts = nn.ModuleList(
+                [
+                    (Qwen3NextMLP(config, intermediate_size=config.moe_intermediate_size) if i in self.experts_range else None)
+                    for i in range(self.num_experts)
+                ]
+            )
+        else:
+            self.experts = nn.ModuleList([Qwen3NextMLP(config, intermediate_size=config.moe_intermediate_size) for _ in range(self.num_experts)])
+            self.experts_min = 0
+            self.experts_max = self.num_experts - 1
+            self.experts_range = range(self.experts_min, self.experts_max + 1)
+
+        self.shared_expert = Qwen3NextMLP(config, intermediate_size=config.shared_expert_intermediate_size)
+        self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
+
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         - optimize expert forward, remove dynamic control and dynamic shape
@@ -963,10 +999,9 @@ class GaudiQwen3NextSparseMoeBlock(Qwen3NextSparseMoeBlock):
         # we cast back to the input dtype
         routing_weights = routing_weights.to(hidden_states.dtype)
 
-        experts_range = range(self.num_experts)
-        w1_list = [self.experts[i].gate_proj.weight.squeeze() for i in experts_range]
-        w2_list = [self.experts[i].down_proj.weight.squeeze() for i in experts_range]
-        w3_list = [self.experts[i].up_proj.weight.squeeze() for i in experts_range]
+        w1_list = [self.experts[i].gate_proj.weight.squeeze() for i in self.experts_range]
+        w2_list = [self.experts[i].down_proj.weight.squeeze() for i in self.experts_range]
+        w3_list = [self.experts[i].up_proj.weight.squeeze() for i in self.experts_range]
 
         final_hidden_states = torch.ops.hpu.mixture_of_experts(
             hidden_states=hidden_states,
@@ -977,12 +1012,14 @@ class GaudiQwen3NextSparseMoeBlock(Qwen3NextSparseMoeBlock):
             w3=w2_list,
             permuted_weights=True,
             activation="silu",
-            experts_min=0,
-            experts_max=(self.num_experts - 1),
+            experts_min=self.experts_min,
+            experts_max=self.experts_max,
         )
         htcore.mark_step()
 
-        if not self.training and _is_deepspeed_initialized(self):
+        if self.ep_size > 1:
+            final_hidden_states = _all_reduce(final_hidden_states)
+        elif not self.training and _is_deepspeed_initialized(self):
             from deepspeed import comm as dist
 
             dist.all_reduce(final_hidden_states, op=dist.ReduceOp.SUM)
@@ -1336,7 +1373,6 @@ class GaudiQwen3NextDecoderLayer(Qwen3NextDecoderLayer):
                 **kwargs,
             )
 
-
         return hidden_states, None , present_key_values
 
     def post_attn_pre_mlp(self, hidden_states, residual):
@@ -1511,7 +1547,7 @@ class GaudiQwen3NextModel(Qwen3NextModel):
                 past_key_values=past_seen_tokens,
                 position_ids=position_ids,
             )
-        linear_attn_mask = self._update_linear_attn_mask(attention_mask, position_ids.squeeze(0))
+        linear_attn_mask = self._update_linear_attn_mask(attention_mask, position_ids[0])
 
         # embed positions
         hidden_states = inputs_embeds
