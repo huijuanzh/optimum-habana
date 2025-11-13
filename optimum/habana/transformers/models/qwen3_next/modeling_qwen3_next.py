@@ -129,22 +129,18 @@ class GaudiQwen3NextMLP(Qwen3NextMLP):
 def gaudi_qwen3next_rmsnorm_forward(self, hidden_states):
     if hidden_states.device.type == "hpu" and has_fused_rms_norm:
         # mixed dtypes are not good for FusedRMSNorm, both inputs need to have same dtype
-        if hidden_states.dtype != self.weight.dtype:
-            orig_dtype = hidden_states.dtype
-            hidden_states = FusedRMSNorm.apply(hidden_states.to(self.weight.dtype), self.weight, self.eps)
-            return hidden_states.to(orig_dtype)
-        else:
-            hidden_states = FusedRMSNorm.apply(hidden_states, self.weight, self.eps)
-            return hidden_states
+        #ori_hidden_states = hidden_states
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        hidden_states += FusedRMSNorm.apply(hidden_states, self.weight.float(), self.eps)
+        return hidden_states.to(input_dtype)
     else:
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         output = hidden_states * torch.rsqrt(hidden_states.pow(2).mean(-1, keepdim=True) + self.eps)
         output = output * (1.0 + self.weight.float())
-        return output.type_as(input_dtype)
-        #variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        #hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        #return self.weight * hidden_states.to(input_dtype)
+        return output.to(input_dtype)
+
 
 def gaudi_qwen3next_rmsnorm_gated_forward(self, hidden_states, gate=None):
     input_dtype = hidden_states.dtype
@@ -159,8 +155,10 @@ def gaudi_qwen3next_rmsnorm_gated_forward(self, hidden_states, gate=None):
             #return hidden_states
     else:
         hidden_states = hidden_states.to(torch.float32)
-        hidden_states = hidden_states * torch.rsqrt(hidden_states.pow(2).mean(-1, keepdim=True) + self.variance_epsilon)
-        hidden_states = hidden_states * (1.0 + self.weight.float())
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        # Norm before gate
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        hidden_states = self.weight * hidden_states.to(input_dtype)
     
     hidden_states = hidden_states * F.silu(gate.to(torch.float32))
     return hidden_states.to(input_dtype)
@@ -483,9 +481,16 @@ class GaudiQwen3NextGatedDeltaNet(Qwen3NextGatedDeltaNet):
         else:
             if use_cache:
                 if attention_mask is not None:
-                    ori_len = attention_mask.sum(dim=1).max().item()   #TODO: consider bs>1 case for different seq lens
-                    pad_len = seq_len - ori_len
-                    conv_state = F.pad(mixed_qkv, (self.conv_kernel_size - ori_len, -pad_len)).float()
+                    start_pos = attention_mask.argmax(dim=1)  # [bs]
+                    end_pos = (attention_mask.size(1) - 1) - attention_mask.flip(1).argmax(dim=1)  # [bs]
+                    real_len = (end_pos - start_pos + 1).clamp(min=0)
+
+                    base_idx = torch.arange(self.conv_kernel_size, device=mixed_qkv.device).unsqueeze(0)  # [1, conv_kernel_size]
+                    start_idx = (end_pos.unsqueeze(1) - self.conv_kernel_size + 1 + base_idx).clamp(min=0, max=seq_len-1)  # [bs, conv_kernel_size]
+                    gathered = mixed_qkv.gather(2, start_idx.unsqueeze(1).expand(-1, mixed_qkv.size(1), -1))  # [bs, hidden_dim, conv_kernel_size]
+                    mask = base_idx < (self.conv_kernel_size - real_len.unsqueeze(1)) # [bs, conv_kernel_size]
+                    mask = mask.unsqueeze(1).expand(-1, mixed_qkv.size(1), -1)  # [bs, hidden_dim, conv_kernel_size]
+                    conv_state = gathered.masked_fill(mask, 0)
                 else:
                     conv_state = F.pad(mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0))
                 self.conv_state = conv_state
@@ -1445,6 +1450,20 @@ class GaudiQwen3NextModel(Qwen3NextModel):
         for layer in self.layers:
             layer.update_sincos_cache(seq_len)
 
+    def _update_linear_attn_mask_gaudi(self, attention_mask, position_ids):
+        """
+        NOTE: Left-padding is used for linear attention mask.
+        No need for zeroing states when
+            1. Cached forward
+            2. Attending to all inputs
+        Note for Gaudi may have left-padding and right-padding at the same time. we pass the linear attention_mask to handle the conv_state init with idx for prefilled phase.
+        """
+        linear_attn_mask = attention_mask
+        seq_len = position_ids.shape[1]
+        if (position_ids[0][0] > 0 and seq_len == 1) or (attention_mask is not None and torch.all(attention_mask == 1)):
+            linear_attn_mask = None
+        return linear_attn_mask
+
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -1547,7 +1566,7 @@ class GaudiQwen3NextModel(Qwen3NextModel):
                 past_key_values=past_seen_tokens,
                 position_ids=position_ids,
             )
-        linear_attn_mask = self._update_linear_attn_mask(attention_mask, position_ids[0])
+        linear_attn_mask = self._update_linear_attn_mask_gaudi(attention_mask, position_ids)
 
         # embed positions
         hidden_states = inputs_embeds
